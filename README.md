@@ -121,16 +121,65 @@ p2pa stop         # stop the PM2 daemon
 | `p2pa log` | Tail `~/.p2pa/shared_context.md` |
 | `p2pa connect` | Print MCP JSON for Cursor / Claude Desktop |
 | `p2pa mcp` | Run foreground MCP + P2P server (stdio) |
+| `p2pa doc create [--title]` | Create a Google Doc war room + anyone-with-link edit |
+| `p2pa doc link <url>` | Bind an existing Google Doc |
+| `p2pa doc unlink` | Clear the doc binding |
+| `p2pa doc status` | Show linked doc + whether SA credentials are set |
 
 Config and state live under **`~/.p2pa/`** (mode `0700`):
 
 | Path | Purpose |
 |------|---------|
-| `config.json` | Pairing topic (`0600`) |
+| `config.json` | Pairing topic + optional doc link (`0600`) |
 | `shared_context.md` | Active State + Conflicts + Audit Trail |
 | `daemon-error.log` | Daemon diagnostics (not mixed into MCP stdout) |
 
 Override the config directory with `P2PA_CONFIG_DIR` (must stay under your home directory).
+
+---
+
+## Living doc (Google Docs steering)
+
+Agents sync machine state over P2P; **humans steer in a shared Google Doc** anyone with the link can edit.
+
+```
+Humans edit "## HUMAN directives"  →  poller  →  Active State key `steering`
+Agents call doc_publish            →  Status / Plan / Agent log sections
+```
+
+### One-time Google setup
+
+1. Create a Google Cloud project; enable **Google Docs API** and **Google Drive API**.
+2. Create a **service account**, download its JSON key.
+3. Export the path (never commit the key; never put it in shared context):
+
+```bash
+export P2PA_GOOGLE_SA_JSON="$HOME/.p2pa/google-sa.json"
+# chmod 600 the key file — path only (never paste the JSON into env / MCP config)
+```
+
+4. Create or link a doc:
+
+```bash
+p2pa doc create --title "Auth refactor war room"
+# or: p2pa doc link "https://docs.google.com/document/d/…/edit"
+p2pa doc status
+```
+
+5. Put `P2PA_GOOGLE_SA_JSON` in your MCP env (`p2pa connect` copies it if already set in your shell), then restart MCP.
+
+Doc sections (exact headings):
+
+| Section | Who writes |
+|---------|------------|
+| `## Status` | Agents (`doc_publish` section=status) |
+| `## Plan` | Agents (`doc_publish` section=plan) |
+| `## HUMAN directives` | Humans (append steering; polled into `steering`) |
+| `## Agent log` | Agents (append-only via `doc_publish` section=agent_log) |
+
+Agents keep running while you edit. They read steering with `doc_read_steering` or `pull_context` key `steering`.
+
+Optional: `P2PA_DOC_POLL_MS` (default `4000`).
 
 ---
 
@@ -147,6 +196,9 @@ Once connected, agents can call:
 | `check_conflicts` | Inspect queued collisions before merging |
 | `resolve_conflict` | Resolve the oldest collision: `accept_peer`, `keep_local`, or `custom_merge` |
 | `read_context_history` | Read the last *N* lines of the local markdown log |
+| `doc_publish` | Push status / plan / agent_log to the linked Google Doc |
+| `doc_read_steering` | Read HUMAN directives (optional force poll) |
+| `doc_status` | Living-doc link + poll health (no secrets) |
 
 ### Conflict flow
 
@@ -178,6 +230,8 @@ p2pa log
 ## Security notes
 
 - The **topic string is a capability secret** — anyone who knows it can join the Hyperswarm room and read/write shared state. Prefer long random topics (auto-generated codes are 22 characters).
+- The **Google Doc link is also a capability** — with “anyone with the link = editor,” anyone who has the URL can steer agents via HUMAN directives. Rotate by creating a new doc + `p2pa doc unlink`.
+- Service account JSON (`P2PA_GOOGLE_SA_JSON`) must stay on disk / in MCP env only — never in Active State, the Doc, or P2P patches.
 - Config directory defaults to `0700`; `config.json` is written as `0600`.
 - Do not put credentials or production secrets into shared context.
 - Background daemon logs go to `daemon-error.log` so MCP stdout stays a clean JSON-RPC stream.
@@ -193,6 +247,7 @@ npm install
 npm run build
 npm run smoke            # Hyperswarm two-node sync
 npm run smoke:conflict   # versioned collision + resolve strategies
+npm run smoke:doc        # living-doc bridge (mock Google Docs, no keys)
 ```
 
 Package entrypoint: `p2pa` → `dist/cli.js`.
@@ -201,8 +256,9 @@ Package entrypoint: `p2pa` → `dist/cli.js`.
 
 ## Roadmap ideas
 
+- Notion / other living-doc adapters  
 - Authenticated topics / invite tokens  
-- Single-writer lock when daemon + MCP both run  
+- Single-writer lock when daemon + MCP both run (partially covered by doc-bridge.lock)  
 - Optional Streamable HTTP transport alongside stdio  
 - Richer CRDT or vector-clock merge policies  
 

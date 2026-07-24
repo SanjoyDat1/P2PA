@@ -6,3 +6,5 @@ logs/
 shared_context.md
 .env
 .env.*
+**/google-sa.json
+**/*-sa.json

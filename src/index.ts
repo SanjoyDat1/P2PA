@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * P2PA — runtime (Phase 5)
+ * P2PA — runtime (Phase 5 + living-doc bridge)
  *
  * Modes:
  *   P2PA_DAEMON=1  → background Hyperswarm sync (no MCP); logs → daemon-error.log
@@ -16,6 +16,7 @@ import { resolveRuntimeOptions } from "./daemon-options.js";
 import {
   ensureConfigDir,
   getDaemonErrorLogPath,
+  readConfig,
 } from "./config.js";
 import { ContextStore } from "./store.js";
 import { MarkdownLog } from "./markdown-log.js";
@@ -27,6 +28,12 @@ import {
   handleInboundPatch,
   recordMessage,
 } from "./sync.js";
+import { DocBridge } from "./doc/bridge.js";
+import {
+  releaseDocBridgeLock,
+  tryAcquireDocBridgeLock,
+} from "./doc/bridge-lock.js";
+import { createGoogleDocsClientFromEnv } from "./doc/google-docs-client.js";
 import type { PeerEnvelope } from "./types.js";
 
 function isDaemonMode(): boolean {
@@ -71,10 +78,47 @@ function installDaemonLogging(): WriteStream {
   return stream;
 }
 
+function tryCreateDocBridge(services: {
+  store: ContextStore;
+  log: MarkdownLog;
+  p2p?: P2PNode;
+  conflicts?: ConflictQueue;
+}): DocBridge | undefined {
+  const config = readConfig();
+  const doc = config?.doc;
+  if (!doc) return undefined;
+
+  const client = createGoogleDocsClientFromEnv();
+  if (!client) {
+    console.error(
+      "[p2pa:doc] Doc linked but P2PA_GOOGLE_SA_JSON is missing/invalid — bridge disabled",
+    );
+    return undefined;
+  }
+
+  if (!tryAcquireDocBridgeLock()) {
+    console.error(
+      "[p2pa:doc] Another p2pa process already holds the living-doc poller lock — bridge disabled here",
+    );
+    return undefined;
+  }
+
+  const bridge = new DocBridge({
+    documentId: doc.documentId,
+    url: doc.url,
+    client,
+    services,
+  });
+  bridge.start();
+  console.error(`[p2pa:doc] Living doc bridge polling ${doc.url}`);
+  return bridge;
+}
+
 async function main(): Promise<void> {
   ensureConfigDir();
   const daemon = isDaemonMode();
   let logStream: WriteStream | undefined;
+  let docBridge: DocBridge | undefined;
 
   if (daemon) {
     logStream = installDaemonLogging();
@@ -107,13 +151,16 @@ async function main(): Promise<void> {
   });
   await p2p.start();
 
+  docBridge = tryCreateDocBridge({ store, log, p2p, conflicts });
+
   if (daemon) {
     console.error(
       `[p2pa] Phase 5 daemon running — topic fingerprint=${p2p.fingerprint} (no MCP stdio)`,
     );
-    // Keep the process alive for Hyperswarm; PM2 manages lifecycle.
     const shutdown = async (): Promise<void> => {
       try {
+        docBridge?.stop();
+        releaseDocBridgeLock();
         await p2p.close();
       } finally {
         logStream?.end();
@@ -129,12 +176,31 @@ async function main(): Promise<void> {
     return;
   }
 
-  const mcp = createMcpServer({ store, log, p2p, conflicts });
+  const mcp = createMcpServer({
+    store,
+    log,
+    p2p,
+    conflicts,
+    doc: docBridge,
+  });
   await startMcpServer(mcp);
 
   console.error(
     `[p2pa] Phase 5 MCP running — topic fingerprint=${p2p.fingerprint}`,
   );
+
+  const shutdownMcp = async (): Promise<void> => {
+    docBridge?.stop();
+    releaseDocBridgeLock();
+    await p2p.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", () => {
+    void shutdownMcp();
+  });
+  process.on("SIGTERM", () => {
+    void shutdownMcp();
+  });
 }
 
 function handlePeerEnvelope(

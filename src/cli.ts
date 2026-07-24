@@ -9,6 +9,7 @@
  *   log              Tail ~/.p2pa/shared_context.md
  *   connect          Print MCP JSON config for Cursor / Claude Desktop
  *   mcp              Run foreground MCP+P2P server (stdio — for agents)
+ *   doc create|link|unlink|status  Google Docs living-doc bridge
  */
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -20,6 +21,7 @@ import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import {
   DAEMON_NAME,
+  clearDocLink,
   ensureConfigDir,
   ensureTopic,
   getConfigDir,
@@ -27,7 +29,13 @@ import {
   getDaemonOutLogPath,
   getSharedContextPath,
   readConfig,
+  setDocLink,
 } from "./config.js";
+import {
+  createGoogleDocsClientFromEnv,
+  documentUrl,
+  extractDocumentId,
+} from "./doc/google-docs-client.js";
 
 const require = createRequire(import.meta.url);
 const pm2 = require("pm2") as {
@@ -145,6 +153,13 @@ async function cmdStart(topicArg?: string): Promise<void> {
         HOME: process.env["HOME"],
         USER: process.env["USER"],
         TMPDIR: process.env["TMPDIR"],
+        ...(process.env["P2PA_GOOGLE_SA_JSON"] &&
+        !process.env["P2PA_GOOGLE_SA_JSON"].trim().startsWith("{")
+          ? { P2PA_GOOGLE_SA_JSON: process.env["P2PA_GOOGLE_SA_JSON"] }
+          : {}),
+        ...(process.env["P2PA_DOC_POLL_MS"]
+          ? { P2PA_DOC_POLL_MS: process.env["P2PA_DOC_POLL_MS"] }
+          : {}),
       },
       out_file: getDaemonOutLogPath(),
       error_file: getDaemonErrorLogPath(),
@@ -266,14 +281,20 @@ async function cmdLog(): Promise<void> {
 
 function cmdConnect(): void {
   const { command, argsPrefix } = resolveP2paCommand();
+  const env: Record<string, string> = {
+    P2PA_CONFIG_DIR: getConfigDir(),
+  };
+  const sa = process.env["P2PA_GOOGLE_SA_JSON"];
+  if (sa && sa.trim().length > 0 && !sa.trim().startsWith("{")) {
+    env["P2PA_GOOGLE_SA_JSON"] = sa.trim();
+  }
+
   const config = {
     mcpServers: {
       "p2pa": {
         command,
         args: [...argsPrefix, "mcp"],
-        env: {
-          P2PA_CONFIG_DIR: getConfigDir(),
-        },
+        env,
       },
     },
   };
@@ -286,7 +307,9 @@ function cmdConnect(): void {
       `- \`p2pa mcp\` runs the agent-facing MCP server over stdio.\n` +
       `- Optional: \`p2pa start\` runs a background Hyperswarm daemon\n` +
       `  sharing ~/.p2pa/shared_context.md (prefer one writer at a time).\n` +
-      `- Pairing topic is stored in ${join(getConfigDir(), "config.json")}.\n`,
+      `- Pairing topic is stored in ${join(getConfigDir(), "config.json")}.\n` +
+      `- Living doc: set P2PA_GOOGLE_SA_JSON (SA key path) in MCP env, then\n` +
+      `  \`p2pa doc create\` and restart MCP so doc_* tools work.\n`,
   );
 }
 
@@ -319,6 +342,92 @@ async function cmdMcp(): Promise<void> {
     child.on("exit", (c) => resolve(c ?? 1));
   });
   process.exit(code);
+}
+
+function requireGoogleClient() {
+  const client = createGoogleDocsClientFromEnv();
+  if (!client) {
+    throw new Error(
+      `Set P2PA_GOOGLE_SA_JSON to a service-account JSON **file path** under your home directory ` +
+        `(not inline JSON). Enable Google Docs API + Drive API for that SA.`,
+    );
+  }
+  return client;
+}
+
+async function cmdDocCreate(title?: string): Promise<void> {
+  ensureConfigDir();
+  ensureTopic();
+  const client = requireGoogleClient();
+  const docTitle = title?.trim() || "P2PA Mission";
+  const created = await client.createDoc(docTitle);
+  await client.shareAnyoneWriter(created.documentId);
+  setDocLink({ documentId: created.documentId, url: created.url });
+  process.stdout.write(
+    `✓ Living doc created\n` +
+      `  url: ${created.url}\n` +
+      `  id:  ${created.documentId}\n` +
+      `\n` +
+      `Anyone with the link can edit (writer). Treat the URL like a capability secret.\n` +
+      `Restart \`p2pa mcp\` (or the daemon) so the bridge starts polling.\n` +
+      `Agents: doc_publish / doc_read_steering / doc_status\n`,
+  );
+}
+
+async function cmdDocLink(urlOrId: string): Promise<void> {
+  ensureConfigDir();
+  ensureTopic();
+  const documentId = extractDocumentId(urlOrId);
+  if (!documentId) {
+    throw new Error("Could not parse a Google Doc id from that URL/id");
+  }
+  const client = requireGoogleClient();
+  // Verify the SA can read the doc before saving the link.
+  await client.getDocument(documentId);
+  const url = documentUrl(documentId);
+  setDocLink({ documentId, url });
+  process.stdout.write(
+    `✓ Linked living doc\n` +
+      `  url: ${url}\n` +
+      `  id:  ${documentId}\n` +
+      `\n` +
+      `Ensure the service account can edit the doc, and prefer “anyone with the link = editor”\n` +
+      `so teammates can interrupt. Restart \`p2pa mcp\` to start polling.\n`,
+  );
+}
+
+function cmdDocUnlink(): void {
+  const prev = clearDocLink();
+  if (!prev) {
+    process.stdout.write("No living doc was linked.\n");
+    return;
+  }
+  process.stdout.write(
+    `✓ Unlinked living doc (${prev.documentId})\n` +
+      `  (Google credentials unchanged — only the doc binding was cleared)\n`,
+  );
+}
+
+function cmdDocStatus(): void {
+  const config = readConfig();
+  const doc = config?.doc;
+  const hasSa = createGoogleDocsClientFromEnv() !== null;
+  if (!doc) {
+    process.stdout.write(
+      `p2pa doc status\n` +
+        `  linked: false\n` +
+        `  sa:     ${hasSa ? "P2PA_GOOGLE_SA_JSON present" : "missing"}\n` +
+        `  hint:   p2pa doc create | p2pa doc link <url>\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `p2pa doc status\n` +
+      `  linked: true\n` +
+      `  url:    ${doc.url}\n` +
+      `  id:     ${doc.documentId}\n` +
+      `  sa:     ${hasSa ? "P2PA_GOOGLE_SA_JSON present" : "missing (bridge will not start)"}\n`,
+  );
 }
 
 async function main(): Promise<void> {
@@ -367,7 +476,63 @@ async function main(): Promise<void> {
         await cmdMcp();
       },
     )
-    .demandCommand(1, "Specify a command: start | stop | status | log | connect | mcp")
+    .command(
+      "doc",
+      "Google Docs living-doc bridge (create / link / unlink / status)",
+      (y) =>
+        y
+          .command(
+            "create",
+            "Create a shared Google Doc, set anyone-with-link writer, save link",
+            (yy) =>
+              yy.option("title", {
+                type: "string",
+                describe: "Document title",
+                default: "P2PA Mission",
+              }),
+            async (argv) => {
+              await cmdDocCreate(argv.title);
+            },
+          )
+          .command(
+            "link <urlOrId>",
+            "Bind an existing Google Doc (must be readable by the service account)",
+            (yy) =>
+              yy.positional("urlOrId", {
+                type: "string",
+                describe: "Docs URL or document id",
+                demandOption: true,
+              }),
+            async (argv) => {
+              await cmdDocLink(String(argv.urlOrId));
+            },
+          )
+          .command(
+            "unlink",
+            "Clear the saved doc binding (keeps SA credentials)",
+            () => {},
+            () => {
+              cmdDocUnlink();
+            },
+          )
+          .command(
+            "status",
+            "Show linked doc URL and whether SA credentials are present",
+            () => {},
+            () => {
+              cmdDocStatus();
+            },
+          )
+          .demandCommand(1, "Specify: create | link | unlink | status")
+          .strict(),
+      () => {
+        // nested commands handle work
+      },
+    )
+    .demandCommand(
+      1,
+      "Specify a command: start | stop | status | log | connect | mcp | doc",
+    )
     .strict()
     .help()
     .parseAsync();

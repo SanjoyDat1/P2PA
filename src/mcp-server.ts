@@ -5,6 +5,7 @@ import type { ContextStore } from "./store.js";
 import type { MarkdownLog } from "./markdown-log.js";
 import type { P2PNode } from "./p2p.js";
 import type { ConflictQueue } from "./conflicts.js";
+import type { DocBridge } from "./doc/bridge.js";
 import {
   commitLocalMutation,
   recordMessage,
@@ -26,6 +27,8 @@ export interface AppServices {
   log: MarkdownLog;
   p2p: P2PNode;
   conflicts: ConflictQueue;
+  /** Optional Google Docs living-doc bridge. */
+  doc?: DocBridge;
 }
 
 function formatJsonValue(value: JsonValue): string {
@@ -41,7 +44,7 @@ function formatJsonValue(value: JsonValue): string {
 export function createMcpServer(services: AppServices): McpServer {
   const server = new McpServer({
     name: "p2pa",
-    version: "0.5.0",
+    version: "0.6.0",
   });
 
   server.registerTool(
@@ -355,6 +358,152 @@ export function createMcpServer(services: AppServices): McpServer {
           {
             type: "text" as const,
             text: history.length > 0 ? history : "(log is empty)",
+          },
+        ],
+      };
+    },
+  );
+
+  server.registerTool(
+    "doc_publish",
+    {
+      description:
+        "Publish to the linked Google Doc living surface. Use status/plan to replace those sections, or agent_log to append a timestamped line. Uses revision-checked retries so concurrent HUMAN edits are re-merged; agents are not paused.",
+      inputSchema: {
+        section: z
+          .enum(["status", "plan", "agent_log"])
+          .describe("Which doc section to update"),
+        content: z
+          .string()
+          .min(1)
+          .max(MAX_PAYLOAD_BYTES)
+          .describe("Section body (status/plan) or log line (agent_log)"),
+      },
+    },
+    async ({ section, content }) => {
+      if (!services.doc) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "No living doc linked (or Google credentials missing). " +
+                "Run `p2pa doc create` or `p2pa doc link` and set P2PA_GOOGLE_SA_JSON.",
+            },
+          ],
+          isError: true,
+        };
+      }
+      try {
+        await services.doc.publish(section, content);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text" as const, text: message }],
+          isError: true,
+        };
+      }
+      console.error(`[mcp] doc_publish section=${section}`);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Published to ${section} on ${services.doc.url}`,
+          },
+        ],
+      };
+    },
+  );
+
+  server.registerTool(
+    "doc_read_steering",
+    {
+      description:
+        "Read the latest HUMAN directives mirrored into Active State key `steering`. Pass refresh=true to force a Google Doc poll first.",
+      inputSchema: {
+        refresh: z
+          .boolean()
+          .optional()
+          .describe("If true, poll the Google Doc before reading"),
+      },
+    },
+    async ({ refresh }) => {
+      if (!services.doc) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "No living doc linked (or Google credentials missing). " +
+                "Run `p2pa doc create` or `p2pa doc link` and set P2PA_GOOGLE_SA_JSON.",
+            },
+          ],
+          isError: true,
+        };
+      }
+      try {
+        const steering =
+          refresh === true
+            ? await services.doc.refreshSteering()
+            : services.doc.readSteering();
+        if (!steering) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "No steering yet (HUMAN directives empty or not polled).",
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(steering, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text" as const, text: message }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.registerTool(
+    "doc_status",
+    {
+      description:
+        "Show living-doc link status (URL, poll health). Never returns credentials.",
+      inputSchema: {},
+    },
+    async () => {
+      if (!services.doc) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  linked: false,
+                  hint: "Run p2pa doc create|link and set P2PA_GOOGLE_SA_JSON",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(services.doc.getStatus(), null, 2),
           },
         ],
       };

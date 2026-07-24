@@ -15,8 +15,15 @@ import { TOPIC_CODE_LENGTH, TOPIC_MIN_RECOMMENDED_LENGTH } from "./types.js";
 
 export const DAEMON_NAME = "p2pa-daemon";
 
+export interface DocLinkConfig {
+  documentId: string;
+  url: string;
+}
+
 export interface P2paConfig {
   topic: string;
+  /** Optional Google Doc living-doc binding (no secrets). */
+  doc?: DocLinkConfig;
 }
 
 /** Resolve ~/.p2pa (or a home-scoped P2PA_CONFIG_DIR override). */
@@ -125,10 +132,12 @@ export function readConfig(): P2paConfig | null {
       raw !== null &&
       typeof raw === "object" &&
       !Array.isArray(raw) &&
-      typeof (raw as P2paConfig).topic === "string" &&
-      (raw as P2paConfig).topic.length > 0
+      typeof (raw as { topic?: unknown }).topic === "string" &&
+      (raw as { topic: string }).topic.length > 0
     ) {
-      return { topic: (raw as P2paConfig).topic };
+      const topic = (raw as { topic: string }).topic;
+      const doc = parseDocLink((raw as { doc?: unknown }).doc);
+      return doc ? { topic, doc } : { topic };
     }
   } catch {
     // ignore corrupt config
@@ -136,11 +145,34 @@ export function readConfig(): P2paConfig | null {
   return null;
 }
 
+function parseDocLink(raw: unknown): DocLinkConfig | undefined {
+  if (raw === null || raw === undefined || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const obj = raw as { documentId?: unknown; url?: unknown };
+  if (
+    typeof obj.documentId === "string" &&
+    obj.documentId.length > 0 &&
+    typeof obj.url === "string" &&
+    obj.url.length > 0
+  ) {
+    return { documentId: obj.documentId, url: obj.url };
+  }
+  return undefined;
+}
+
 export function writeConfig(config: P2paConfig): void {
   ensureConfigDir();
   const path = getConfigPath();
   const tmp = join(dirname(path), `.config.${process.pid}.tmp.json`);
-  writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n", {
+  const payload: P2paConfig = { topic: config.topic };
+  if (config.doc) {
+    payload.doc = {
+      documentId: config.doc.documentId,
+      url: config.doc.url,
+    };
+  }
+  writeFileSync(tmp, JSON.stringify(payload, null, 2) + "\n", {
     encoding: "utf8",
     mode: 0o600,
   });
@@ -150,6 +182,34 @@ export function writeConfig(config: P2paConfig): void {
   } catch {
     // best-effort
   }
+}
+
+/** Persist topic while preserving an existing doc link. */
+export function writeTopicPreservingDoc(topic: string): void {
+  const existing = readConfig();
+  if (existing?.doc) {
+    writeConfig({ topic, doc: existing.doc });
+  } else {
+    writeConfig({ topic });
+  }
+}
+
+export function setDocLink(doc: DocLinkConfig): void {
+  const existing = readConfig();
+  if (!existing) {
+    throw new Error(
+      "No pairing topic yet — run `p2pa start --topic …` or `p2pa mcp` once first.",
+    );
+  }
+  writeConfig({ topic: existing.topic, doc });
+}
+
+export function clearDocLink(): DocLinkConfig | null {
+  const existing = readConfig();
+  if (!existing) return null;
+  const prev = existing.doc ?? null;
+  writeConfig({ topic: existing.topic });
+  return prev;
 }
 
 /**
@@ -169,14 +229,14 @@ export function ensureTopic(explicit?: string): {
         `[p2pa] WARNING: topic is only ${topic.length} chars; prefer ≥${TOPIC_MIN_RECOMMENDED_LENGTH}.`,
       );
     }
-    writeConfig({ topic });
+    writeTopicPreservingDoc(topic);
     return { topic, generated: false };
   }
 
   const fromEnv = process.env["P2PA_TOPIC"];
   if (fromEnv && fromEnv.trim().length > 0) {
     const topic = fromEnv.trim();
-    writeConfig({ topic });
+    writeTopicPreservingDoc(topic);
     return { topic, generated: false };
   }
 
