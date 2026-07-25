@@ -28,7 +28,8 @@
     "build": "tsc",
     "start": "node dist/cli.js",
     "dev": "tsx src/index.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "test": "tsx --test --test-concurrency=1 test/*.test.ts",
     "smoke": "tsx scripts/smoke-p2p.ts",
     "smoke:conflict": "tsx scripts/smoke-conflict.ts",
     "smoke:doc": "tsx scripts/smoke-doc.ts"
@@ -40,6 +41,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "fast-json-patch": "^3.1.1",
     "googleapis": "^173.0.0",
+    "hyperdht": "^6.21.0",
     "hyperswarm": "^4.17.0",
     "pm2": "^6.0.8",
     "yargs": "^18.0.0",

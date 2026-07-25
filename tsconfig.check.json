@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // Widened only for checking — the build config keeps rootDir at src/ so
+    // dist/ layout is unchanged.
+    "rootDir": ".",
+    "declaration": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  },
+  "include": ["src/**/*", "scripts/**/*", "test/**/*"]
+}

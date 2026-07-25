@@ -69,13 +69,18 @@ async function main(): Promise<void> {
       }
     };
 
+  // This smoke test covers the transport, not authentication — `open` keeps it
+  // focused on sync behaviour. Peer authentication has its own suite in
+  // test/firewall.test.ts, which runs against a local DHT testnet.
   const nodeA = new P2PNode({
     topic,
+    authMode: "open",
     getActiveState: () => storeA.snapshot(),
     onPeerMessage: handle(storeA, logA),
   });
   const nodeB = new P2PNode({
     topic,
+    authMode: "open",
     getActiveState: () => storeB.snapshot(),
     onPeerMessage: handle(storeB, logB),
   });

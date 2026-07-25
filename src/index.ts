@@ -17,10 +17,13 @@ import {
   ensureConfigDir,
   getDaemonErrorLogPath,
   readConfig,
+  resolveAuthMode,
 } from "./config.js";
+import { loadOrCreateIdentity } from "./identity.js";
+import { createAllowlist } from "./allowlist.js";
 import { ContextStore } from "./store.js";
 import { MarkdownLog } from "./markdown-log.js";
-import { P2PNode } from "./p2p.js";
+import { P2PNode, describePeer, type PeerIdentity } from "./p2p.js";
 import { ConflictQueue } from "./conflicts.js";
 import { createMcpServer, startMcpServer } from "./mcp-server.js";
 import {
@@ -34,7 +37,7 @@ import {
   tryAcquireDocBridgeLock,
 } from "./doc/bridge-lock.js";
 import { createGoogleDocsClientFromEnv } from "./doc/google-docs-client.js";
-import type { PeerEnvelope } from "./types.js";
+import type { AuditPeer, PeerEnvelope } from "./types.js";
 
 function isDaemonMode(): boolean {
   return process.env["P2PA_DAEMON"] === "1";
@@ -142,13 +145,54 @@ async function main(): Promise<void> {
     `[p2pa] Markdown log: ${log.path} (hydrated ${Object.keys(hydrated).length} key(s), _version=${store.getVersion()})`,
   );
 
+  const identity = loadOrCreateIdentity();
+  const { mode: authMode, legacy } = resolveAuthMode(readConfig());
+  const allowlist = createAllowlist();
+
+  console.error(
+    `[p2pa] identity ${identity.fingerprint} (${identity.label}) — ` +
+      `auth=${authMode}, ${allowlist.size} allowlisted peer(s)`,
+  );
+  if (authMode === "open") {
+    console.error(
+      legacy
+        ? "[p2pa] WARNING: running in legacy OPEN mode — anyone who learns your " +
+            "topic can read and write your shared context. Pair your peers " +
+            "(`p2pa pair`) then run `p2pa auth strict`."
+        : "[p2pa] WARNING: auth mode is OPEN — anyone who learns your topic can " +
+            "read and write your shared context. Run `p2pa auth strict` to lock it down.",
+    );
+  } else if (allowlist.size === 0) {
+    console.error(
+      "[p2pa] auth is STRICT and the allowlist is empty — no peer can connect. " +
+        "Run `p2pa pair` to exchange invite tokens.",
+    );
+  }
+
   const p2p = new P2PNode({
     topic: options.topic,
+    keyPair: identity.keyPair,
+    authMode,
+    isPeerAllowed: (pubkey) => allowlist.isAllowed(pubkey),
+    lookupPeer: (pubkey) => allowlist.lookup(pubkey),
     getActiveState: () => store.snapshot(),
-    onPeerMessage: (envelope: PeerEnvelope, remoteLabel: string) => {
-      handlePeerEnvelope({ store, log, conflicts }, envelope, remoteLabel);
+    onPeerMessage: (envelope: PeerEnvelope, peer: PeerIdentity) => {
+      handlePeerEnvelope({ store, log, conflicts }, envelope, peer);
     },
   });
+
+  allowlist.onChange(() => {
+    // A peer removed from the allowlist should lose its live session too, not
+    // just be barred from reconnecting.
+    const closed = p2p.enforceAllowlist();
+    if (closed > 0) {
+      console.error(`[p2pa:auth] closed ${closed} revoked peer connection(s)`);
+    }
+    // And a peer just added should be discovered now rather than on the next
+    // 10-minute Hyperswarm refresh tick.
+    void p2p.refreshDiscovery();
+  });
+
   await p2p.start();
 
   docBridge = tryCreateDocBridge({ store, log, p2p, conflicts });
@@ -161,6 +205,7 @@ async function main(): Promise<void> {
       try {
         docBridge?.stop();
         releaseDocBridgeLock();
+        allowlist.close();
         await p2p.close();
       } finally {
         logStream?.end();
@@ -192,6 +237,7 @@ async function main(): Promise<void> {
   const shutdownMcp = async (): Promise<void> => {
     docBridge?.stop();
     releaseDocBridgeLock();
+    allowlist.close();
     await p2p.close();
     process.exit(0);
   };
@@ -210,10 +256,16 @@ function handlePeerEnvelope(
     conflicts: ConflictQueue;
   },
   envelope: PeerEnvelope,
-  remoteLabel: string,
+  peer: PeerIdentity,
 ): void {
+  const remoteLabel = describePeer(peer);
+  const audit: AuditPeer = {
+    fingerprint: peer.fingerprint,
+    label: peer.label,
+  };
+
   if (envelope.type === "snapshot") {
-    const result = applyPeerSnapshot(services, envelope.state, "Peer");
+    const result = applyPeerSnapshot(services, envelope.state, "Peer", audit);
     if (!result.ok) {
       console.error(
         `[p2pa] rejected peer snapshot from ${remoteLabel}: ${result.error}`,
@@ -227,7 +279,7 @@ function handlePeerEnvelope(
   }
 
   if (envelope.type === "patch") {
-    const result = handleInboundPatch(services, envelope.ops);
+    const result = handleInboundPatch(services, envelope.ops, audit);
     if (result.status === "collision") {
       console.error(
         `[p2pa] queued collision ${result.conflictId} from ${remoteLabel}`,
@@ -246,7 +298,7 @@ function handlePeerEnvelope(
     return;
   }
 
-  recordMessage(services, envelope.text, "Peer", false);
+  recordMessage(services, envelope.text, "Peer", false, audit);
   console.error(
     `[p2pa] peer message from ${remoteLabel} (${envelope.text.length} chars)`,
   );
