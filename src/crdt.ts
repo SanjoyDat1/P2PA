@@ -26,10 +26,27 @@ import {
   type Hlc,
   type HybridClock,
 } from "./hlc.js";
+import {
+  claimWins,
+  isAcceptableClaimStamp,
+  isAcceptableGen,
+  isAcceptableTtl,
+  isClaimKey,
+  isCollectable,
+  nextGeneration,
+  type ClaimEntry,
+} from "./claim.js";
 import type { ContextState, JsonValue } from "./types.js";
 
 /** Maximum distinct keys in one document. */
 export const MAX_CRDT_KEYS = 10_000;
+/**
+ * Maximum concurrent leases.
+ *
+ * Separate from the state budget so a flood of leases cannot crowd out the
+ * shared context — and bounded, because leases were previously exempt entirely.
+ */
+export const MAX_CLAIM_KEYS = 1_000;
 /** Maximum live elements in one set. */
 export const MAX_SET_ELEMENTS = 5_000;
 /** Maximum retained remove-tags in one set. */
@@ -67,7 +84,7 @@ export interface OrSetEntry {
   removes: string[];
 }
 
-export type CrdtEntry = LwwEntry | OrSetEntry;
+export type CrdtEntry = LwwEntry | OrSetEntry | ClaimEntry;
 
 /** One key's state, as it travels on the wire and in snapshots. */
 export interface CrdtOp {
@@ -90,6 +107,10 @@ function isOrSet(entry: CrdtEntry): entry is OrSetEntry {
   return entry.kind === "orset";
 }
 
+function isClaim(entry: CrdtEntry): entry is ClaimEntry {
+  return entry.kind === "claim";
+}
+
 /**
  * Does `candidate` replace `current`?
  *
@@ -106,8 +127,8 @@ function entryWins(candidate: CrdtEntry, current: CrdtEntry): boolean {
 
 /** Highest lww stamp either side has seen for this key. Monotone, so it converges. */
 function highestFloor(a: CrdtEntry, b: CrdtEntry): Hlc | undefined {
-  const left = isOrSet(a) ? a.floor : a.hlc;
-  const right = isOrSet(b) ? b.floor : b.hlc;
+  const left = isOrSet(a) ? a.floor : isClaim(a) ? undefined : a.hlc;
+  const right = isOrSet(b) ? b.floor : isClaim(b) ? undefined : b.hlc;
   if (!left) return right;
   if (!right) return left;
   return compareHlc(left, right) >= 0 ? left : right;
@@ -145,6 +166,9 @@ function mergeAdds(
 }
 
 function canonicalEntry(entry: CrdtEntry): string {
+  if (isClaim(entry)) {
+    return `claim:${entry.gen}:${entry.ttl}:${entry.released === true ? "r" : "a"}`;
+  }
   return isOrSet(entry)
     ? `orset:${canonicalize(entry.adds as JsonValue)}:${[...entry.removes].sort().join(",")}`
     : `lww:${entry.deleted === true ? "-" : canonicalize((entry.value ?? null) as JsonValue)}`;
@@ -177,10 +201,20 @@ export class CrdtDoc {
     return this.entries.size;
   }
 
+  /** Leases on record, which have their own budget. */
+  private claimKeyCount(): number {
+    let count = 0;
+    for (const entry of this.entries.values()) {
+      if (isClaim(entry)) count += 1;
+    }
+    return count;
+  }
+
   /** Keys that currently hold a value — tombstones do not consume the budget. */
   private liveKeyCount(): number {
     let live = 0;
     for (const entry of this.entries.values()) {
+      if (isClaim(entry)) continue;
       if (!isOrSet(entry) && entry.deleted === true) continue;
       live += 1;
     }
@@ -196,6 +230,12 @@ export class CrdtDoc {
    */
   private collectTombstones(now: number): void {
     for (const [key, entry] of this.entries) {
+      if (isClaim(entry)) {
+        // An expired lease is kept a while so a late op cannot reinstate it,
+        // then dropped so finished tasks do not accumulate forever.
+        if (isCollectable(entry, now)) this.entries.delete(key);
+        continue;
+      }
       if (isOrSet(entry) || entry.deleted !== true) continue;
       if (now - entry.hlc.w > TOMBSTONE_TTL_MS) this.entries.delete(key);
     }
@@ -296,6 +336,63 @@ export class CrdtDoc {
     };
   }
 
+  /** Read the lease on a task key, if any. */
+  claimEntry(key: string): ClaimEntry | undefined {
+    const entry = this.entries.get(key);
+    return entry && isClaim(entry) ? entry : undefined;
+  }
+
+  /** Every lease on record, expired ones included. */
+  claimEntries(): Array<{ key: string; entry: ClaimEntry }> {
+    const out: Array<{ key: string; entry: ClaimEntry }> = [];
+    for (const [key, entry] of this.entries) {
+      if (isClaim(entry)) out.push({ key, entry: structuredClone(entry) });
+    }
+    return out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  }
+
+  /**
+   * Take the next generation of a lease.
+   *
+   * Callers check availability first; this only mints the op. Taking `gen + 1`
+   * unconditionally is what makes a stale op from the previous generation
+   * harmless whenever it turns up.
+   */
+  takeClaim(key: string, ttl: number, note?: string): CrdtOp | null {
+    const current = this.claimEntry(key);
+    const entry: ClaimEntry = {
+      kind: "claim",
+      hlc: this.clock.tick(),
+      gen: nextGeneration(current),
+      ttl,
+      ...(note !== undefined ? { note } : {}),
+    };
+    // Refuse to record a lease the merge rule would discard: storing one would
+    // tell this node's agent it holds work every peer says it does not.
+    if (current && !claimWins(entry, current)) return null;
+    this.entries.set(key, entry);
+    return { key, entry };
+  }
+
+  /** End the current generation of a lease. Absorbing, so it cannot be undone. */
+  releaseClaim(key: string): CrdtOp | null {
+    const current = this.claimEntry(key);
+    if (!current) return null;
+    // Carries the claim's own stamp, not a fresh one: that is what makes a
+    // release beat exactly the claim it ends, and what makes forging one
+    // require the holder's node id.
+    const entry: ClaimEntry = {
+      kind: "claim",
+      hlc: { ...current.hlc },
+      gen: current.gen,
+      ttl: current.ttl,
+      released: true,
+      ...(current.note !== undefined ? { note: current.note } : {}),
+    };
+    this.entries.set(key, entry);
+    return { key, entry };
+  }
+
   // ---- merge --------------------------------------------------------------
 
   /**
@@ -311,18 +408,54 @@ export class CrdtDoc {
     if (!isAcceptableHlc(entry.hlc, now)) {
       return { key, status: "rejected", reason: "stamp out of bounds" };
     }
+    if (isClaimKey(key) !== isClaim(entry)) {
+      return {
+        key,
+        status: "rejected",
+        reason: isClaim(entry)
+          ? "lease entry outside the lease namespace"
+          : "state entry inside the lease namespace",
+      };
+    }
+    if (
+      isClaim(entry) &&
+      (!isAcceptableTtl(entry.ttl) ||
+        !isAcceptableGen(entry.gen) ||
+        !isAcceptableClaimStamp(entry, now))
+    ) {
+      return { key, status: "rejected", reason: "lease bounds exceeded" };
+    }
     if (JSON.stringify(entry).length > MAX_VALUE_BYTES) {
       return { key, status: "rejected", reason: "entry exceeds value size limit" };
     }
     if (!this.entries.has(key)) {
       this.collectTombstones(now);
-      if (this.liveKeyCount() >= MAX_CRDT_KEYS) {
+      if (isClaim(entry)) {
+        if (this.claimKeyCount() >= MAX_CLAIM_KEYS) {
+          return { key, status: "rejected", reason: "lease limit reached" };
+        }
+      } else if (this.liveKeyCount() >= MAX_CRDT_KEYS) {
         return { key, status: "rejected", reason: "document key limit reached" };
       }
     }
 
     this.clock.observe(entry.hlc);
     const current = this.entries.get(key);
+
+    // Leases resolve first-come-wins within a generation, so they cannot share
+    // the last-write-wins path used by state.
+    if (isClaim(entry)) {
+      if (current && isClaim(current)) {
+        if (!claimWins(entry, current)) return { key, status: "ignored" };
+        const previous = current.hlc.n;
+        this.entries.set(key, entry);
+        return previous !== entry.hlc.n
+          ? { key, status: "contended", previousNode: previous }
+          : { key, status: "applied" };
+      }
+      this.entries.set(key, entry);
+      return { key, status: "applied" };
+    }
 
     if (!current) {
       this.entries.set(key, isOrSet(entry) ? this.boundSet(entry) : entry);
@@ -445,6 +578,7 @@ export class CrdtDoc {
         out[key] = tags.map((tag) => entry.adds[tag] as JsonValue);
         continue;
       }
+      if (isClaim(entry)) continue;
       if (entry.deleted === true) continue;
       out[key] = entry.value as JsonValue;
     }
@@ -453,7 +587,7 @@ export class CrdtDoc {
 
   get(key: string): JsonValue | undefined {
     const entry = this.entries.get(key);
-    if (!entry) return undefined;
+    if (!entry || isClaim(entry)) return undefined;
     if (isOrSet(entry)) {
       const removed = new Set(entry.removes);
       return Object.keys(entry.adds)
@@ -479,9 +613,19 @@ export class CrdtDoc {
   /** Replace all entries, e.g. when rehydrating from disk. */
   load(ops: CrdtOp[], now: number): void {
     this.entries.clear();
-    for (const op of ops) {
+    // State first: leases are transient and sort ahead of ordinary keys, so a
+    // key-ordered truncation would drop the user's actual context to keep them.
+    const ordered = [
+      ...ops.filter((op) => !isClaim(op.entry)),
+      ...ops.filter((op) => isClaim(op.entry)),
+    ];
+    for (const op of ordered) {
       if (!isAcceptableHlc(op.entry.hlc, now)) continue;
-      if (this.entries.size >= MAX_CRDT_KEYS) break;
+      if (isClaim(op.entry)) {
+        if (this.claimKeyCount() >= MAX_CLAIM_KEYS) continue;
+      } else if (this.liveKeyCount() >= MAX_CRDT_KEYS) {
+        continue;
+      }
       this.clock.observe(op.entry.hlc);
       this.entries.set(op.key, structuredClone(op.entry));
     }
@@ -492,6 +636,15 @@ export class CrdtDoc {
    * Two peers that agree produce the same digest, so divergence is detectable
    * rather than silent.
    */
+  /** Digest over leases, which `stateHash` deliberately excludes. */
+  claimsHash(): string {
+    const rows = this.claimEntries().map(
+      ({ key, entry }) =>
+        `${key}|${entry.gen}|${entry.hlc.w}|${entry.hlc.c}|${entry.hlc.n}|${entry.ttl}|${entry.released === true ? 1 : 0}`,
+    );
+    return createHash("sha256").update(rows.join("\n")).digest("hex").slice(0, 16);
+  }
+
   stateHash(): string {
     return createHash("sha256")
       .update(canonicalize(this.materialize() as unknown as JsonValue))

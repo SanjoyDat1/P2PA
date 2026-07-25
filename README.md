@@ -27,6 +27,7 @@ Multi-agent collaboration is still broken in three ways:
 - **Key-based peer authentication** — Only allowlisted ed25519 keys can connect. No inbound access from a leaked topic.
 - **Per-key CRDT merge** — Every key carries its own hybrid logical clock. Two agents writing different keys never conflict; two agents writing the same key resolve to the same winner on every replica, with no arbitration step.
 - **Add-wins sets** — Concurrent appends to a list all survive, instead of one agent's entries overwriting the other's.
+- **Work-claiming leases** — An agent claims a task before starting it, so two agents never do the same job. Leases expire on their own, so a crashed agent cannot block the backlog.
 - **Human-readable audit log** — Every change lands in `~/.p2pa/shared_context.md`, attributed to the peer that made it.
 
 ---
@@ -268,11 +269,48 @@ Once connected, agents can call:
 | `send_peer_message` | Send a text message into the peer’s audit trail |
 | `check_conflicts` | List recent concurrent updates (already settled; informational) |
 | `override_context` | Impose your own values when the automatic winner is wrong by intent |
+| `claim_task` | Take a lease on a task so a peer does not start the same work |
+| `release_task` | Hand a task back before its lease expires |
+| `list_claims` | See which tasks are in flight and who holds them |
 | `sync_health` | Replica id, content hash, peer count — equal hashes mean equal state |
 | `read_context_history` | Read the last *N* lines of the local markdown log |
 | `doc_publish` | Push status / plan / agent_log to the linked Google Doc |
 | `doc_read_steering` | Read HUMAN directives (optional force poll) |
 | `doc_status` | Living-doc link + poll health (no secrets) |
+
+### Claiming work
+
+State sync stops two agents overwriting each other; it does not stop them doing
+the same job twice. A lease fixes that:
+
+```
+Agent A: claim_task("refactor-auth")   → holds it until 14:32
+Agent B: claim_task("refactor-auth")   → already held by a3f9c1b2, picks another task
+```
+
+- **Exactly one holder.** Two agents racing for the same task converge on one
+  winner, in any delivery order, without asking each other.
+- **First come, first served.** Within a lease generation the earliest claim
+  wins, so an honest agent cannot take a task by simply writing again.
+- **Leases expire.** A crashed agent stops blocking the task once its TTL runs
+  out; whoever claims next takes the following generation, so a stale op from
+  the dead lease can never reinstate it.
+- **Release is final.** Handing a task back cannot be undone by a claim that was
+  still in flight.
+
+`claim_task` waits one propagation window before answering, so an agent is never
+told it owns work it has already lost.
+
+Two honest limitations:
+
+- Two *partitioned* nodes can both believe they hold the same lease until they
+  can talk again. No protocol without a quorum can avoid that, and P2PA has no
+  quorum by design. The lease narrows duplicate work to the propagation delay —
+  it is not a distributed mutex.
+- A lease protects against races, not against a hostile peer. An allowlisted
+  peer can bid a higher generation and take a live lease, just as it can
+  overwrite any state key. Displaced leases surface in `check_conflicts` and the
+  audit trail. Pair with peers you trust.
 
 ### How merge works
 
@@ -294,12 +332,13 @@ handshake snapshot to overwrite state it never held.
 
 Every update, snapshot handshake, peer message, and refusal is written to a human-readable markdown file at `~/.p2pa/shared_context.md`.
 
-The file has four sections:
+The file has five sections:
 
 1. **Active State** — current shared JSON, plain and human-readable
 2. **Replica State** — the same document plus per-key stamps (machine-managed)
-3. **Concurrent Updates** — recent settled contention (omitted when empty)
-4. **Audit Trail** — append-only history of patches, messages, and resolutions
+3. **Claims** — which tasks are in flight and who holds them (omitted when empty)
+4. **Concurrent Updates** — recent settled contention (omitted when empty)
+5. **Audit Trail** — append-only history of patches, messages, and resolutions
 
 Tail it during development:
 
@@ -333,6 +372,7 @@ npm run build
 npm test                 # unit + integration suite (offline)
 npm run smoke            # Hyperswarm two-node sync (needs internet)
 npm run smoke:merge      # concurrent merge, same-key resolution, set adds
+npm run smoke:claim      # two agents racing the same backlog
 npm run smoke:doc        # living-doc bridge (mock Google Docs, no keys)
 ```
 

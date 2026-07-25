@@ -32,7 +32,8 @@
     "test": "tsx --test --test-concurrency=1 test/*.test.ts",
     "smoke": "tsx scripts/smoke-p2p.ts",
     "smoke:doc": "tsx scripts/smoke-doc.ts",
-    "smoke:merge": "tsx scripts/smoke-merge.ts"
+    "smoke:merge": "tsx scripts/smoke-merge.ts",
+    "smoke:claim": "tsx scripts/smoke-claim.ts"
   },
   "engines": {
     "node": ">=18"

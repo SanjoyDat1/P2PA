@@ -1,6 +1,13 @@
 import { z } from "zod";
 import type { CrdtOp } from "./crdt.js";
 import type { Hlc } from "./hlc.js";
+import {
+  CLAIM_KEY_PREFIX,
+  MAX_ACCEPTED_CLAIM_GEN,
+  MAX_CLAIM_TTL_MS,
+  MIN_CLAIM_TTL_MS,
+  TASK_ID_PATTERN,
+} from "./claim.js";
 
 export type Source = "Local" | "Peer";
 
@@ -22,7 +29,9 @@ export type AuditAction =
   | "Message"
   | "Concurrent Update"
   | "Override"
-  | "Rejected Update";
+  | "Rejected Update"
+  | "Claim"
+  | "Release";
 
 /**
  * Wire protocol version.
@@ -152,13 +161,34 @@ export interface RejectedUpdateAudit {
   keys: string[];
 }
 
+export interface ClaimAudit {
+  source: Source;
+  peer?: AuditPeer;
+  action: "Claim";
+  taskId: string;
+  holder: string;
+  generation: number;
+  expiresAt: string;
+}
+
+export interface ReleaseAudit {
+  source: Source;
+  peer?: AuditPeer;
+  action: "Release";
+  taskId: string;
+  holder: string;
+  generation: number;
+}
+
 export type AuditEntry =
   | StateUpdateAudit
   | StateSnapshotAudit
   | MessageAudit
   | ConcurrentUpdateAudit
   | OverrideAudit
-  | RejectedUpdateAudit;
+  | RejectedUpdateAudit
+  | ClaimAudit
+  | ReleaseAudit;
 
 export function isReservedKey(key: string): boolean {
   return (RESERVED_KEYS as readonly string[]).includes(key);
@@ -175,6 +205,15 @@ const LwwEntrySchema = z.object({
   hlc: HlcSchema,
   value: z.unknown().optional(),
   deleted: z.boolean().optional(),
+});
+
+const ClaimEntrySchema = z.object({
+  kind: z.literal("claim"),
+  hlc: HlcSchema,
+  gen: z.number().int().min(0).max(MAX_ACCEPTED_CLAIM_GEN),
+  ttl: z.number().int().min(MIN_CLAIM_TTL_MS).max(MAX_CLAIM_TTL_MS),
+  released: z.boolean().optional(),
+  note: z.string().max(500).optional(),
 });
 
 const OrSetEntrySchema = z.object({
@@ -213,13 +252,37 @@ export function exceedsDepth(value: unknown, limit = MAX_JSON_DEPTH): boolean {
 const CrdtOpSchema = z
   .object({
     key: z.string().min(1).max(MAX_KEY_LENGTH).regex(CONTEXT_KEY_PATTERN),
-    entry: z.discriminatedUnion("kind", [LwwEntrySchema, OrSetEntrySchema]),
+    entry: z.discriminatedUnion("kind", [
+      LwwEntrySchema,
+      OrSetEntrySchema,
+      ClaimEntrySchema,
+    ]),
   })
   .superRefine((op, ctx) => {
     if (isReservedKey(op.key)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: "Reserved key is not allowed",
+      });
+    }
+    const claimKey = op.key.startsWith(CLAIM_KEY_PREFIX);
+    if (claimKey) {
+      const taskId = op.key.slice(CLAIM_KEY_PREFIX.length);
+      if (!TASK_ID_PATTERN.test(taskId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Malformed task id in lease key",
+        });
+      }
+    }
+    // Leases and state never share a key, on any path in — including the
+    // on-disk replica, which the runtime treats as untrusted.
+    if (claimKey !== (op.entry.kind === "claim")) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: claimKey
+          ? "Lease namespace accepts only lease entries"
+          : "Lease entry outside the lease namespace",
       });
     }
     if (exceedsDepth(op.entry)) {

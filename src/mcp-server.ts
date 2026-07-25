@@ -7,10 +7,17 @@ import type { P2PNode } from "./p2p.js";
 import type { ContentionLog } from "./conflicts.js";
 import type { DocBridge } from "./doc/bridge.js";
 import {
+  claimTask,
   commitLocalMutation,
   overrideKeys,
   recordMessage,
+  releaseTask,
 } from "./sync.js";
+import {
+  DEFAULT_CLAIM_TTL_MS,
+  MAX_CLAIM_TTL_MS,
+  MIN_CLAIM_TTL_MS,
+} from "./claim.js";
 import {
   MAX_KEY_LENGTH,
   MAX_PAYLOAD_BYTES,
@@ -45,6 +52,28 @@ function textResult(text: string): ToolResult {
 
 function errorResult(text: string): ToolResult {
   return { content: [{ type: "text" as const, text }], isError: true };
+}
+
+/** How long to wait for a competing claim to arrive before answering. */
+const CLAIM_SETTLE_MS = 250;
+
+/**
+ * Confirm a freshly taken lease still belongs to us.
+ *
+ * `claimTask` answers from local state, which cannot yet reflect a peer that
+ * claimed the same task microseconds earlier. With peers connected, waiting one
+ * short window costs little and turns a provisional answer into a reliable one;
+ * with nobody connected there is nothing to wait for.
+ */
+async function settleClaim(
+  services: AppServices,
+  taskId: string,
+): Promise<boolean> {
+  if (services.p2p.connectionCount() === 0) {
+    return services.store.holdsClaim(taskId);
+  }
+  await new Promise((resolve) => setTimeout(resolve, CLAIM_SETTLE_MS));
+  return services.store.holdsClaim(taskId);
 }
 
 const contextKeySchema = z
@@ -256,6 +285,134 @@ export function createMcpServer(services: AppServices): McpServer {
   );
 
   server.registerTool(
+    "claim_task",
+    {
+      description:
+        "Take a lease on a task so another agent does not start the same work. " +
+        "Returns whether you hold it and, if not, who does. Re-claiming a task " +
+        "you already hold renews the lease. Call release_task when finished — " +
+        "otherwise the lease expires on its own, so a crash cannot block the task.",
+      inputSchema: {
+        task_id: z
+          .string()
+          .min(1)
+          .max(128)
+          .describe("Stable identifier for the unit of work, e.g. refactor-auth"),
+        ttl_seconds: z
+          .number()
+          .int()
+          .min(MIN_CLAIM_TTL_MS / 1000)
+          .max(MAX_CLAIM_TTL_MS / 1000)
+          .optional()
+          .describe(
+            `How long to hold it without renewing (default ${DEFAULT_CLAIM_TTL_MS / 1000}s)`,
+          ),
+        note: z
+          .string()
+          .max(500)
+          .optional()
+          .describe("What you are doing, shown to the other agent"),
+      },
+    },
+    async ({ task_id, ttl_seconds, note }) => {
+      const ttl = (ttl_seconds ?? DEFAULT_CLAIM_TTL_MS / 1000) * 1000;
+      const result = claimTask(services, task_id, ttl, note);
+      if (!result.ok) {
+        return errorResult(
+          `Cannot claim "${task_id}": ${result.error}. Pick different work, or ` +
+            `call list_claims to see what is in flight.`,
+        );
+      }
+
+      // A peer that claimed at the same moment may not have reached us yet.
+      // Wait one propagation window and re-check, so the agent is never told it
+      // owns work it has already lost.
+      let settled = await settleClaim(services, task_id);
+      let view = result.view;
+
+      if (!settled && services.store.holder(task_id) === null) {
+        // Nobody holds it, yet we did not win — we raced a lease that had
+        // already lapsed and, having never seen it, claimed the same generation
+        // it did. Now that the older entry is on record, a second attempt takes
+        // the generation above it and settles cleanly.
+        const retried = claimTask(services, task_id, ttl, note);
+        if (retried.ok) {
+          view = retried.view;
+          settled = await settleClaim(services, task_id);
+        }
+      }
+
+      if (!settled) {
+        const holder = services.store.holder(task_id);
+        return errorResult(
+          `Lost the race for "${task_id}" to ${holder ?? "another agent"}. ` +
+            `Pick different work.`,
+        );
+      }
+
+      console.error(`[mcp] claim_task task=${task_id} ttl=${ttl}ms`);
+      return textResult(
+        `You hold "${task_id}" until ${view.expiresAt} ` +
+          `(generation ${view.generation}). Call release_task when done.`,
+      );
+    },
+  );
+
+  server.registerTool(
+    "release_task",
+    {
+      description:
+        "Give up a lease you hold so another agent can pick the task up now " +
+        "rather than waiting for it to expire.",
+      inputSchema: {
+        task_id: z.string().min(1).max(128).describe("Task to release"),
+      },
+    },
+    async ({ task_id }) => {
+      const result = releaseTask(services, task_id);
+      if (!result.ok) return errorResult(`Cannot release "${task_id}": ${result.error}`);
+      console.error(`[mcp] release_task task=${task_id}`);
+      return textResult(`Released "${task_id}".`);
+    },
+  );
+
+  server.registerTool(
+    "list_claims",
+    {
+      description:
+        "Show every task lease this node knows about, who holds it, and when it " +
+        "expires. Check before starting work to avoid duplicating a peer.",
+      inputSchema: {
+        include_expired: z
+          .boolean()
+          .optional()
+          .describe("Include leases that have already ended"),
+      },
+    },
+    async ({ include_expired }) => {
+      const all = services.store.listClaims();
+      const shown = include_expired === true ? all : all.filter((view) => view.held);
+      if (shown.length === 0) {
+        return textResult(
+          include_expired === true
+            ? "No task leases on record."
+            : "No tasks are currently claimed.",
+        );
+      }
+      return textResult(
+        JSON.stringify(
+          shown.map((view) => ({
+            ...view,
+            heldByYou: view.holder === services.store.nodeId,
+          })),
+          null,
+          2,
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
     "sync_health",
     {
       description:
@@ -273,6 +430,15 @@ export function createMcpServer(services: AppServices): McpServer {
             connectedPeers: services.p2p.connectionCount(),
             blockedConnections: services.p2p.blockedConnections,
             concurrentUpdates: services.contention.size,
+            claimsHash: services.store.claimsHash(),
+            claimsHeldHere: services.store
+              .listClaims()
+              .filter((view) => view.held && view.holder === services.store.nodeId)
+              .length,
+            claimsHeldByPeers: services.store
+              .listClaims()
+              .filter((view) => view.held && view.holder !== services.store.nodeId)
+              .length,
           },
           null,
           2,

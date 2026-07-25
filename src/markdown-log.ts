@@ -12,6 +12,7 @@ import {
 import { dirname, join } from "node:path";
 import type { CrdtOp } from "./crdt.js";
 import { sanitizeLabel } from "./peer-key.js";
+import type { ClaimView } from "./claim.js";
 import type {
   AuditEntry,
   AuditPeer,
@@ -23,6 +24,7 @@ import type {
 const TITLE = "# P2PA Shared Context";
 const ACTIVE_HEADING = "## Active State";
 const REPLICA_HEADING = "## Replica State";
+const CLAIMS_HEADING = "## Claims";
 const CONFLICTS_HEADING = "## Concurrent Updates";
 const AUDIT_HEADING = "## Audit Trail";
 
@@ -127,6 +129,14 @@ export class MarkdownLog {
     );
   }
 
+  /** Rewrite ## Claims from the live leases (omit the section when empty). */
+  rewriteClaims(views: ClaimView[]): void {
+    this.ensureInitialized();
+    const parts = readParts(readFileSync(this.filePath, "utf8"));
+    parts.claims = formatClaims(views).trim();
+    atomicWrite(this.filePath, renderDoc(parts));
+  }
+
   /** Rewrite ## Concurrent Updates (omit the section when empty). */
   rewriteContention(items: ContentionItem[]): void {
     this.ensureInitialized();
@@ -198,6 +208,7 @@ function buildSkeleton(state: ContextState): string {
   return renderDoc({
     active: jsonBlock(state),
     replica: replicaBlock([]),
+    claims: "",
     contention: "",
     audit: "",
   });
@@ -214,6 +225,18 @@ function replicaBlock(ops: CrdtOp[]): string {
     JSON.stringify(ops) +
     "\n```"
   );
+}
+
+function formatClaims(views: ClaimView[]): string {
+  const live = views.filter((view) => view.held);
+  if (live.length === 0) return "";
+  let body = "| Task | Holder | Expires | Note |\n| --- | --- | --- | --- |\n";
+  for (const view of live) {
+    body +=
+      `| \`${safe(view.taskId)}\` | \`${safe(view.holder)}\` | ` +
+      `${safe(view.expiresAt)} | ${view.note ? safe(view.note) : "—"} |\n`;
+  }
+  return body;
 }
 
 function formatContentionItems(items: ContentionItem[]): string {
@@ -260,6 +283,7 @@ function escapeRegExp(value: string): string {
 const SECTION_HEADINGS = [
   ACTIVE_HEADING,
   REPLICA_HEADING,
+  CLAIMS_HEADING,
   CONFLICTS_HEADING,
   AUDIT_HEADING,
 ] as const;
@@ -292,6 +316,7 @@ function sliceSection(content: string, heading: string): string | undefined {
 interface DocParts {
   active: string;
   replica: string;
+  claims: string;
   contention: string;
   audit: string;
 }
@@ -300,6 +325,7 @@ function readParts(content: string): DocParts {
   return {
     active: sliceSection(content, ACTIVE_HEADING)?.trim() ?? jsonBlock({}),
     replica: sliceSection(content, REPLICA_HEADING)?.trim() ?? replicaBlock([]),
+    claims: sliceSection(content, CLAIMS_HEADING)?.trim() ?? "",
     contention: sliceSection(content, CONFLICTS_HEADING)?.trim() ?? "",
     audit: sliceSection(content, AUDIT_HEADING)?.trim() ?? "",
   };
@@ -309,6 +335,9 @@ function renderDoc(parts: DocParts): string {
   let out = `${TITLE}\n\n`;
   out += `${ACTIVE_HEADING}\n${parts.active}\n\n`;
   out += `${REPLICA_HEADING}\n${parts.replica}\n\n`;
+  if (parts.claims.length > 0) {
+    out += `${CLAIMS_HEADING}\n\n${parts.claims}\n\n`;
+  }
   if (parts.contention.length > 0) {
     out += `${CONFLICTS_HEADING}\n\n${parts.contention}\n\n`;
   }
@@ -379,6 +408,22 @@ function renderAuditEntry(entry: AuditEntry): string {
       `${head} - [ACTION: Rejected Update]\n` +
       `- **Reason:** ${safe(entry.reason)}\n` +
       `- **Keys:** ${entry.keys.map((k) => `\`${safe(k)}\``).join(", ") || "(none)"}\n`
+    );
+  }
+
+  if (entry.action === "Claim") {
+    return (
+      `${head} - [ACTION: Claim]\n` +
+      `- **Task:** \`${safe(entry.taskId)}\`\n` +
+      `- **Holder:** \`${safe(entry.holder)}\` (generation ${entry.generation})\n` +
+      `- **Expires:** ${safe(entry.expiresAt)}\n`
+    );
+  }
+  if (entry.action === "Release") {
+    return (
+      `${head} - [ACTION: Release]\n` +
+      `- **Task:** \`${safe(entry.taskId)}\`\n` +
+      `- **Holder:** \`${safe(entry.holder)}\` (generation ${entry.generation})\n`
     );
   }
 

@@ -13,6 +13,13 @@ import {
   type Source,
 } from "./types.js";
 import { nodeIdFromPublicKey } from "./hlc.js";
+import {
+  describeClaim,
+  isClaimKey,
+  taskIdFromKey,
+  type ClaimEntry,
+  type ClaimView,
+} from "./claim.js";
 
 export interface SyncServices {
   store: ContextStore;
@@ -267,6 +274,38 @@ function absorb(
     });
   }
 
+  // One rewrite for the whole batch. Writing per lease made a single envelope
+  // cost time quadratic in its size, with the whole file re-rendered each pass.
+  const leaseKeys = touched.filter((key) => isClaimKey(key));
+  if (leaseKeys.length > 0) {
+    const now = services.store.nowMs();
+    const claimed: string[] = [];
+    const released: string[] = [];
+    for (const key of leaseKeys.slice(0, 50)) {
+      const taskId = taskIdFromKey(key);
+      const entry = taskId === null ? undefined : services.store.claim(taskId);
+      if (taskId === null || !entry) continue;
+      (describeClaim(taskId, entry, now).released ? released : claimed).push(taskId);
+    }
+    if (claimed.length > 0) {
+      services.log.syncMarkdownLog({
+        source,
+        peer,
+        action: "State Update",
+        keys: claimed.map((id) => `lease:${id}`),
+      });
+    }
+    if (released.length > 0) {
+      services.log.syncMarkdownLog({
+        source,
+        peer,
+        action: "State Update",
+        keys: released.map((id) => `release:${id}`),
+      });
+    }
+    services.log.rewriteClaims(services.store.listClaims());
+  }
+
   if (touched.length > 0 && options.snapshot !== true) {
     services.log.syncStateUpdate(
       source,
@@ -333,6 +372,74 @@ export function overrideKeys(
     detail,
   });
   return result;
+}
+
+export type ClaimOutcome =
+  | { ok: true; view: ClaimView }
+  | { ok: false; error: string; holder?: string };
+
+/**
+ * Take a lease and tell peers about it.
+ *
+ * The answer is provisional against a peer that claimed at the same moment and
+ * whose op has not arrived yet — see `settleClaim`, which the MCP layer uses to
+ * turn this into a definitive one before an agent acts on it.
+ */
+export function claimTask(
+  services: SyncServices,
+  taskId: string,
+  ttlMs: number,
+  note?: string,
+): ClaimOutcome {
+  let taken: { ok: true; op: CrdtOp } | { ok: false; holder: string };
+  try {
+    taken = services.store.takeClaim(taskId, ttlMs, note);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  if (!taken.ok) {
+    return { ok: false, error: `already held by ${taken.holder}`, holder: taken.holder };
+  }
+
+  const committed = commitLocalMutation(services, () => taken.op);
+  if (!committed.ok) return { ok: false, error: committed.error };
+
+  const entry = services.store.claim(taskId);
+  const view = describeClaim(taskId, entry as ClaimEntry, services.store.nowMs());
+  services.log.syncMarkdownLog({
+    source: "Local",
+    action: "Claim",
+    taskId,
+    holder: view.holder,
+    generation: view.generation,
+    expiresAt: view.expiresAt,
+  });
+  services.log.rewriteClaims(services.store.listClaims());
+  return { ok: true, view };
+}
+
+/** Give up a lease and tell peers. */
+export function releaseTask(
+  services: SyncServices,
+  taskId: string,
+): ClaimOutcome {
+  const released = services.store.releaseClaim(taskId);
+  if (!released.ok) return { ok: false, error: released.reason };
+
+  const committed = commitLocalMutation(services, () => released.op);
+  if (!committed.ok) return { ok: false, error: committed.error };
+
+  const entry = services.store.claim(taskId) as ClaimEntry;
+  const view = describeClaim(taskId, entry, services.store.nowMs());
+  services.log.syncMarkdownLog({
+    source: "Local",
+    action: "Release",
+    taskId,
+    holder: view.holder,
+    generation: view.generation,
+  });
+  services.log.rewriteClaims(services.store.listClaims());
+  return { ok: true, view };
 }
 
 /** Record a peer/local message in the Audit Trail and optionally broadcast. */
