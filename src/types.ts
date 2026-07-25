@@ -1,5 +1,6 @@
 import { z } from "zod";
-import type { Operation } from "fast-json-patch";
+import type { CrdtOp } from "./crdt.js";
+import type { Hlc } from "./hlc.js";
 
 export type Source = "Local" | "Peer";
 
@@ -14,47 +15,35 @@ export interface AuditPeer {
   fingerprint: string;
   label: string | null;
 }
+
 export type AuditAction =
-  | "State Patch"
+  | "State Update"
   | "State Snapshot"
   | "Message"
-  | "Conflict Resolution"
-  | "Collision Detected";
+  | "Concurrent Update"
+  | "Override"
+  | "Rejected Update";
 
-/** Root key used for masterless conflict detection (integer Lamport-style clock). */
-export const VERSION_KEY = "_version";
+/**
+ * Wire protocol version.
+ *
+ * Bumped from the `_version`-counter protocol, whose merge rule could not
+ * express two writes happening at once. An envelope without it comes from an
+ * incompatible build and is refused rather than half-understood.
+ */
+export const PROTOCOL_VERSION = 2;
 
-/** Max queued collisions awaiting LLM resolution. */
-export const MAX_CONFLICT_QUEUE = 50;
+/** Document key used by the retired counter protocol; dropped on hydrate. */
+export const LEGACY_VERSION_KEY = "_version";
 
-export type MergeStrategy = "accept_peer" | "keep_local" | "custom_merge";
+/** Max entries retained in the contended-write log. */
+export const MAX_CONTENTION_LOG = 50;
 
-export interface ConflictItem {
-  id: string;
-  peerOps: Operation[];
-  peerVersion: number | null;
-  localState: ContextState;
-  localVersion: number;
-  detectedAt: string;
-}
+/** Max contended-write entries per peer, so one peer cannot flood the log. */
+export const MAX_CONTENTION_PER_PEER = 10;
 
-export interface ConflictResolutionAudit {
-  source: Source;
-  peer?: AuditPeer;
-  action: "Conflict Resolution";
-  strategy: MergeStrategy;
-  conflictId: string;
-  detail: string;
-}
-
-export interface CollisionDetectedAudit {
-  source: Source;
-  peer?: AuditPeer;
-  action: "Collision Detected";
-  localVersion: number;
-  peerVersion: number | null;
-  conflictId: string;
-}
+/** Max CRDT ops carried by a single envelope. */
+export const MAX_OPS_PER_ENVELOPE = 10_000;
 
 /** JSON-compatible value stored in shared state (no `any`). */
 export type JsonValue =
@@ -65,7 +54,7 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-/** Top-level shared document. */
+/** Top-level shared document, as agents see it. */
 export type ContextState = Record<string, JsonValue>;
 
 /** Max bytes for a single NDJSON line / serialized envelope (1 MiB). */
@@ -92,17 +81,38 @@ export interface CliOptions {
   contextFile: string;
 }
 
-export interface StatePatchAudit {
+/**
+ * A write that landed on a key some other node had written.
+ *
+ * Both replicas pick the same winner from the HLC order, so this records
+ * something already settled rather than asking for a decision. It exists so an
+ * agent can notice it was overruled and react.
+ */
+export interface ContentionItem {
+  id: string;
+  key: string;
+  /** Node id that previously held the key. */
+  previousNode: string;
+  /** Peer fingerprint the winning write arrived from, or null when local. */
+  peerFingerprint: string | null;
+  /** Value now in effect. */
+  winningValue: JsonValue | undefined;
+  detectedAt: string;
+}
+
+export interface StateUpdateAudit {
   source: Source;
   peer?: AuditPeer;
-  action: "State Patch";
-  ops: Operation[];
+  action: "State Update";
+  keys: string[];
 }
 
 export interface StateSnapshotAudit {
   source: Source;
   peer?: AuditPeer;
   action: "State Snapshot";
+  applied: number;
+  ignored: number;
 }
 
 export interface MessageAudit {
@@ -112,99 +122,155 @@ export interface MessageAudit {
   text: string;
 }
 
-export type AuditEntry =
-  | StatePatchAudit
-  | StateSnapshotAudit
-  | MessageAudit
-  | ConflictResolutionAudit
-  | CollisionDetectedAudit;
-
-/** True if a JSON Pointer path touches a reserved object key. */
-export function pointerHasReservedSegment(pointer: string): boolean {
-  const raw = pointer.startsWith("/") ? pointer.slice(1) : pointer;
-  if (raw.length === 0) return false;
-  const segments = raw.split("/").map((s) => s.replace(/~1/g, "/").replace(/~0/g, "~"));
-  return segments.some((seg) =>
-    (RESERVED_KEYS as readonly string[]).includes(seg),
-  );
+export interface ConcurrentUpdateAudit {
+  source: Source;
+  peer?: AuditPeer;
+  action: "Concurrent Update";
+  key: string;
+  previousNode: string;
 }
 
-const JsonPatchOpSchema = z
+export interface OverrideAudit {
+  source: Source;
+  peer?: AuditPeer;
+  action: "Override";
+  keys: string[];
+  detail: string;
+}
+
+/**
+ * A refused inbound update.
+ *
+ * Recorded rather than only written to stderr: a peer whose writes are being
+ * dropped is otherwise invisible to the agent operating the node.
+ */
+export interface RejectedUpdateAudit {
+  source: Source;
+  peer?: AuditPeer;
+  action: "Rejected Update";
+  reason: string;
+  keys: string[];
+}
+
+export type AuditEntry =
+  | StateUpdateAudit
+  | StateSnapshotAudit
+  | MessageAudit
+  | ConcurrentUpdateAudit
+  | OverrideAudit
+  | RejectedUpdateAudit;
+
+export function isReservedKey(key: string): boolean {
+  return (RESERVED_KEYS as readonly string[]).includes(key);
+}
+
+const HlcSchema = z.object({
+  w: z.number().int().nonnegative(),
+  c: z.number().int().nonnegative(),
+  n: z.string().min(1).max(64),
+});
+
+const LwwEntrySchema = z.object({
+  kind: z.literal("lww"),
+  hlc: HlcSchema,
+  value: z.unknown().optional(),
+  deleted: z.boolean().optional(),
+});
+
+const OrSetEntrySchema = z.object({
+  kind: z.literal("orset"),
+  hlc: HlcSchema,
+  adds: z.record(z.unknown()),
+  removes: z.array(z.string().min(1).max(256)).max(10_000),
+});
+
+/** Keys are interpolated into Markdown, so they may not carry structure. */
+export const CONTEXT_KEY_PATTERN = /^[A-Za-z0-9._:@/-]{1,256}$/;
+
+/** Deepest JSON nesting accepted from a peer. */
+export const MAX_JSON_DEPTH = 32;
+
+/**
+ * Guard recursion before anything walks the value.
+ *
+ * `JSON.parse` happily builds a structure deeper than the stack can traverse,
+ * so a modest payload can crash any later `JSON.stringify`/canonicalize pass.
+ */
+export function exceedsDepth(value: unknown, limit = MAX_JSON_DEPTH): boolean {
+  const walk = (node: unknown, depth: number): boolean => {
+    if (depth > limit) return true;
+    if (node === null || typeof node !== "object") return false;
+    if (Array.isArray(node)) {
+      return node.some((item) => walk(item, depth + 1));
+    }
+    return Object.values(node as Record<string, unknown>).some((item) =>
+      walk(item, depth + 1),
+    );
+  };
+  return walk(value, 0);
+}
+
+const CrdtOpSchema = z
   .object({
-    op: z.enum(["add", "remove", "replace", "move", "copy", "test"]),
-    path: z.string().min(1),
-    from: z.string().optional(),
-    value: z.unknown().optional(),
+    key: z.string().min(1).max(MAX_KEY_LENGTH).regex(CONTEXT_KEY_PATTERN),
+    entry: z.discriminatedUnion("kind", [LwwEntrySchema, OrSetEntrySchema]),
   })
   .superRefine((op, ctx) => {
-    if (op.path === "/") {
+    if (isReservedKey(op.key)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Root document replace via path '/' is not allowed",
+        message: "Reserved key is not allowed",
       });
     }
-    if (pointerHasReservedSegment(op.path)) {
+    if (exceedsDepth(op.entry)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: `Reserved path segment in path: ${op.path}`,
-      });
-    }
-    if (op.from !== undefined && pointerHasReservedSegment(op.from)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: `Reserved path segment in from: ${op.from}`,
+        message: `Entry nests deeper than ${MAX_JSON_DEPTH} levels`,
       });
     }
   });
 
-export const JsonPatchArraySchema = z
-  .array(JsonPatchOpSchema)
+export const CrdtOpArraySchema = z
+  .array(CrdtOpSchema)
   .min(1)
+  .max(MAX_OPS_PER_ENVELOPE)
   .superRefine((ops, ctx) => {
-    const serialized = JSON.stringify(ops);
-    if (serialized.length > MAX_PAYLOAD_BYTES) {
+    if (JSON.stringify(ops).length > MAX_PAYLOAD_BYTES) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: `Patch exceeds max size of ${MAX_PAYLOAD_BYTES} bytes`,
+        message: `Update exceeds max size of ${MAX_PAYLOAD_BYTES} bytes`,
       });
     }
   })
-  .transform((ops) => ops as Operation[]);
+  .transform((ops) => ops as unknown as CrdtOp[]);
 
-const ContextStateSchema = z
-  .record(z.unknown())
-  .superRefine((state, ctx) => {
-    for (const key of Object.keys(state)) {
-      if (isReservedKey(key)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `Reserved key in snapshot: ${key}`,
-        });
-      }
-    }
-    const serialized = JSON.stringify(state);
-    if (serialized.length > MAX_PAYLOAD_BYTES) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: `Snapshot exceeds max size of ${MAX_PAYLOAD_BYTES} bytes`,
-      });
-    }
-  })
-  .transform((state) => state as ContextState);
-
-/** Zod schema for inbound/outbound NDJSON peer envelopes (Phase 3). */
+/** Inbound/outbound NDJSON peer envelopes. */
 export const PeerEnvelopeSchema = z.discriminatedUnion("type", [
   z.object({
-    type: z.literal("patch"),
-    ops: JsonPatchArraySchema,
+    type: z.literal("update"),
+    v: z.literal(PROTOCOL_VERSION),
+    ops: CrdtOpArraySchema,
   }),
   z.object({
     type: z.literal("message"),
+    v: z.literal(PROTOCOL_VERSION),
     text: z.string().min(1).max(MAX_PAYLOAD_BYTES),
   }),
   z.object({
     type: z.literal("snapshot"),
-    state: ContextStateSchema,
+    v: z.literal(PROTOCOL_VERSION),
+    ops: z
+      .array(CrdtOpSchema)
+      .max(MAX_OPS_PER_ENVELOPE)
+      .superRefine((ops, ctx) => {
+        if (JSON.stringify(ops).length > MAX_PAYLOAD_BYTES) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Snapshot exceeds max size of ${MAX_PAYLOAD_BYTES} bytes`,
+          });
+        }
+      })
+      .transform((ops) => ops as unknown as CrdtOp[]),
   }),
 ]);
 
@@ -215,34 +281,4 @@ export function toJsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
 
-export function isReservedKey(key: string): boolean {
-  return (RESERVED_KEYS as readonly string[]).includes(key);
-}
-
-/** Read integer `_version` from state (default 0). */
-export function readLocalVersion(state: ContextState): number {
-  const raw = state[VERSION_KEY];
-  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : 0;
-}
-
-/**
- * Extract intended `_version` from a JSON Patch array.
- * Uses the last `/_version` add/replace. Returns null if missing/invalid
- * or if multiple `/_version` mutations are present (ambiguous / hostile).
- */
-export function extractPatchVersion(ops: Operation[]): number | null {
-  const versionOps = ops.filter((op) => op.path === `/${VERSION_KEY}`);
-  if (versionOps.length !== 1) return null;
-  const op = versionOps[0]!;
-  if (op.op !== "add" && op.op !== "replace") return null;
-  const value = "value" in op ? op.value : undefined;
-  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
-    return value;
-  }
-  return null;
-}
-
-/** Strip any ops that touch `/_version` (system owns the clock). */
-export function stripVersionOps(ops: Operation[]): Operation[] {
-  return ops.filter((op) => op.path !== `/${VERSION_KEY}`);
-}
+export type { Hlc };

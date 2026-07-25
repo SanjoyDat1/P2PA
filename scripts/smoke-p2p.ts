@@ -6,19 +6,17 @@
  * UDP-restricted environments can time out.
  */
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
-import jsonpatch from "fast-json-patch";
 import { ContextStore } from "../src/store.js";
 import { MarkdownLog } from "../src/markdown-log.js";
 import { P2PNode } from "../src/p2p.js";
 import {
   applyPeerSnapshot,
-  applyStatePatch,
+  commitLocalMutation,
+  handleInboundOps,
   recordMessage,
 } from "../src/sync.js";
 import { generateTopicCode } from "../src/topic.js";
 import type { PeerEnvelope } from "../src/types.js";
-
-const { compare } = jsonpatch;
 
 const LOG_DIR = "./logs/smoke";
 const LOG_A = `${LOG_DIR}/a.md`;
@@ -61,9 +59,9 @@ async function main(): Promise<void> {
     (store: ContextStore, log: MarkdownLog) =>
     (envelope: PeerEnvelope): void => {
       if (envelope.type === "snapshot") {
-        applyPeerSnapshot({ store, log }, envelope.state, "Peer");
-      } else if (envelope.type === "patch") {
-        applyStatePatch({ store, log }, envelope.ops, "Peer", false);
+        applyPeerSnapshot({ store, log }, envelope.ops, "Peer");
+      } else if (envelope.type === "update") {
+        handleInboundOps({ store, log }, envelope.ops, "Peer");
       } else {
         recordMessage({ store, log }, envelope.text, "Peer", false);
       }
@@ -75,13 +73,13 @@ async function main(): Promise<void> {
   const nodeA = new P2PNode({
     topic,
     authMode: "open",
-    getActiveState: () => storeA.snapshot(),
+    getActiveState: () => storeA.export(),
     onPeerMessage: handle(storeA, logA),
   });
   const nodeB = new P2PNode({
     topic,
     authMode: "open",
-    getActiveState: () => storeB.snapshot(),
+    getActiveState: () => storeB.export(),
     onPeerMessage: handle(storeB, logB),
   });
 
@@ -96,14 +94,14 @@ async function main(): Promise<void> {
   console.error("[smoke] peers connected");
   await sleep(400); // allow handshake snapshots to settle
 
-  // A pushes nested context via setKey → compare → broadcast patch
-  const ops = storeA.setKey("project", { name: "p2pa", phase: 3 });
-  logA.syncStatePatch("Local", ops, storeA.snapshot());
-  nodeA.broadcast({ type: "patch", ops });
+  // A pushes nested context; the op carries its own stamp.
+  commitLocalMutation({ store: storeA, log: logA, p2p: nodeA }, (store) =>
+    store.setKey("project", { name: "p2pa", phase: 3 }),
+  );
   await waitFor(
     () => storeB.get("project") !== undefined,
     10_000,
-    "patch sync to B",
+    "update sync to B",
   );
 
   // B sends a peer message
@@ -115,22 +113,14 @@ async function main(): Promise<void> {
   );
   await sleep(500);
 
-  // B applies a lightweight patch_context-style update
-  const before = storeB.snapshot();
-  const project = before.project;
+  // B updates the same key. Both replicas agree because the newer stamp wins
+  // everywhere, not because B happened to go second.
+  const project = storeB.get("project");
   if (typeof project !== "object" || project === null || Array.isArray(project)) {
     throw new Error("expected project object on B");
   }
-  const next = {
-    ...before,
-    project: { ...project, phase: 3, ready: true },
-  };
-  const patchOps = compare(before, next);
-  applyStatePatch(
-    { store: storeB, log: logB, p2p: nodeB },
-    patchOps,
-    "Local",
-    true,
+  commitLocalMutation({ store: storeB, log: logB, p2p: nodeB }, (store) =>
+    store.setKey("project", { ...project, phase: 3, ready: true }),
   );
   await waitFor(
     () => {
@@ -172,8 +162,9 @@ async function main(): Promise<void> {
   const fenceLog = new MarkdownLog(`${LOG_DIR}/fence.md`);
   fenceLog.ensureInitialized();
   const fenceStore = new ContextStore();
-  const fenceOps = fenceStore.setKey("note", "before ```json evil after");
-  fenceLog.syncStatePatch("Local", fenceOps, fenceStore.snapshot());
+  commitLocalMutation({ store: fenceStore, log: fenceLog }, (store) =>
+    store.setKey("note", "before ```json evil after"),
+  );
   const rehydrated = fenceLog.readActiveState();
   checks.push([
     "Active State survives ``` in values",
@@ -183,8 +174,9 @@ async function main(): Promise<void> {
   const headingLog = new MarkdownLog(`${LOG_DIR}/heading.md`);
   headingLog.ensureInitialized();
   const headingStore = new ContextStore();
-  const headingOps = headingStore.setKey("doc", "see ## Audit Trail below");
-  headingLog.syncStatePatch("Local", headingOps, headingStore.snapshot());
+  commitLocalMutation({ store: headingStore, log: headingLog }, (store) =>
+    store.setKey("doc", "see ## Audit Trail below"),
+  );
   const headingHydrated = headingLog.readActiveState();
   checks.push([
     "Active State survives ## Audit Trail in values",

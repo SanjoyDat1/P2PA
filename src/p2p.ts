@@ -6,10 +6,11 @@ import type { KeyPair } from "./identity.js";
 import { shortFingerprint } from "./peer-key.js";
 import {
   MAX_PAYLOAD_BYTES,
+  PROTOCOL_VERSION,
   PeerEnvelopeSchema,
   type PeerEnvelope,
-  type ContextState,
 } from "./types.js";
+import type { CrdtOp } from "./crdt.js";
 
 /**
  * Who a message came from. `pubkey` is proven by the Noise handshake — the
@@ -73,8 +74,8 @@ export interface P2POptions {
   lookupPeer?: PeerLookup;
   /** DHT bootstrap override. Only used by the test suite's local testnet. */
   bootstrap?: Array<{ host: string; port: number }>;
-  /** Called to obtain the current Active State for handshake snapshots. */
-  getActiveState: () => ContextState;
+  /** Called to obtain the stamped replica state for handshake snapshots. */
+  getActiveState: () => CrdtOp[];
   onPeerMessage: PeerMessageHandler;
 }
 
@@ -97,7 +98,7 @@ export class P2PNode {
   private readonly swarm: Hyperswarm;
   private readonly topic: string;
   private readonly topicFingerprint: string;
-  private readonly getActiveState: () => ContextState;
+  private readonly getActiveState: () => CrdtOp[];
   private readonly onPeerMessage: PeerMessageHandler;
   private readonly connState = new WeakMap<Duplex, ConnState>();
   private readonly authMode: AuthMode;
@@ -285,10 +286,12 @@ export class P2PNode {
       label: remoteLabel,
     });
 
-    // Handshake: push full Active State so the peer converges immediately.
+    // Handshake: push the stamped replica so the peer converges immediately.
+    // The receiver merges it key by key, so this cannot overwrite their work.
     const snapshot: PeerEnvelope = {
       type: "snapshot",
-      state: this.getActiveState(),
+      v: PROTOCOL_VERSION,
+      ops: this.getActiveState(),
     };
     writeLine(conn, encodeNdjsonLine(snapshot));
 
@@ -359,7 +362,18 @@ export class P2PNode {
       return;
     }
 
-    const result = PeerEnvelopeSchema.safeParse(parsed);
+    let result: ReturnType<typeof PeerEnvelopeSchema.safeParse>;
+    try {
+      result = PeerEnvelopeSchema.safeParse(parsed);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[p2p] destroying ${state.label}: envelope validation failed hard (${message})`,
+      );
+      this.connState.delete(conn);
+      conn.destroy();
+      return;
+    }
     if (!result.success) {
       console.error(
         `[p2p] ignoring invalid envelope from ${state.label}: ${result.error.message}`,
@@ -381,7 +395,15 @@ export class P2PNode {
     }
 
     console.error(`[p2p] received ${envelope.type} from ${state.label}`);
-    this.onPeerMessage(envelope, peer);
+    try {
+      this.onPeerMessage(envelope, peer);
+    } catch (err) {
+      // A malformed envelope must cost this peer its connection, not the daemon.
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[p2p] handler threw for ${state.label}: ${message}`);
+      this.connState.delete(conn);
+      conn.destroy();
+    }
   }
 }
 

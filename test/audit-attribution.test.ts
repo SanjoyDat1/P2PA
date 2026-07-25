@@ -37,12 +37,12 @@ const ANON: AuditPeer = { fingerprint: "c1d0e2f3", label: null };
 
 describe("audit attribution", () => {
   it("records the peer fingerprint and label on a patch", () => {
-    log.syncStatePatch("Peer", [{ op: "add", path: "/k", value: 1 }], { k: 1 }, PEER);
+    log.syncStateUpdate("Peer", ["k"], { k: 1 }, undefined, PEER);
     assert.match(body(), /\[SOURCE: Peer a3f9c1b2 \(sanjoy-laptop\)\]/);
   });
 
   it("records the fingerprint alone when the peer has no label", () => {
-    log.syncStatePatch("Peer", [{ op: "add", path: "/k", value: 1 }], { k: 1 }, ANON);
+    log.syncStateUpdate("Peer", ["k"], { k: 1 }, undefined, ANON);
     assert.match(body(), /\[SOURCE: Peer c1d0e2f3\]/);
     assert.doesNotMatch(body(), /\(null\)/);
   });
@@ -54,32 +54,44 @@ describe("audit attribution", () => {
   });
 
   it("attributes snapshots", () => {
-    log.syncSnapshot("Peer", { k: 1 }, PEER);
+    log.syncSnapshot("Peer", 1, 0, PEER);
     assert.match(body(), /\[SOURCE: Peer a3f9c1b2 \(sanjoy-laptop\)\].*\n.*State Snapshot|State Snapshot/);
     assert.match(body(), /Peer a3f9c1b2/);
   });
 
-  it("attributes collision entries", () => {
+  it("attributes concurrent-update entries", () => {
     log.syncMarkdownLog({
       source: "Peer",
       peer: PEER,
-      action: "Collision Detected",
-      localVersion: 3,
-      peerVersion: 3,
-      conflictId: "abc-123",
+      action: "Concurrent Update",
+      key: "plan",
+      previousNode: "abc123",
     });
     assert.match(body(), /\[SOURCE: Peer a3f9c1b2 \(sanjoy-laptop\)\]/);
-    assert.match(body(), /abc-123/);
+    assert.match(body(), /abc123/);
+  });
+
+  it("attributes refused updates so a dropped peer is visible", () => {
+    log.syncMarkdownLog({
+      source: "Peer",
+      peer: PEER,
+      action: "Rejected Update",
+      reason: "stamp out of bounds",
+      keys: ["mission"],
+    });
+    assert.match(body(), /\[ACTION: Rejected Update\]/);
+    assert.match(body(), /stamp out of bounds/);
+    assert.match(body(), /\[SOURCE: Peer a3f9c1b2 \(sanjoy-laptop\)\]/);
   });
 
   it("leaves Local entries unchanged", () => {
-    log.syncStatePatch("Local", [{ op: "add", path: "/k", value: 1 }], { k: 1 });
+    log.syncStateUpdate("Local", ["k"], { k: 1 });
     assert.match(body(), /\[SOURCE: Local\]/);
     assert.doesNotMatch(body(), /SOURCE: Local /);
   });
 
   it("falls back to bare Peer when attribution is absent", () => {
-    log.syncStatePatch("Peer", [{ op: "add", path: "/k", value: 1 }], { k: 1 });
+    log.syncStateUpdate("Peer", ["k"], { k: 1 });
     assert.match(body(), /\[SOURCE: Peer\]/);
   });
 
@@ -88,7 +100,7 @@ describe("audit attribution", () => {
     // is where the guarantee lives — assert the composed behaviour end to end.
     // The attacker's goal is a *second* heading line attributed to Local.
     const hostile = sanitizeLabel("x)]\n### [2020-01-01] - [SOURCE: Local] - [ACTION: Message");
-    log.syncStatePatch("Peer", [{ op: "add", path: "/k", value: 1 }], { k: 1 }, {
+    log.syncStateUpdate("Peer", ["k"], { k: 1 }, undefined, {
       fingerprint: "deadbeef",
       label: hostile,
     });
@@ -103,7 +115,7 @@ describe("audit attribution", () => {
     // the SOURCE field and cannot close it early to fake ACTION or SOURCE.
     const heading = headings[0]!;
     const shape =
-      /^### \[[\d-]+ [\d:]+\] - \[SOURCE: Peer deadbeef \(([^[\]]*)\)\] - \[ACTION: State Patch\]$/;
+      /^### \[[\d-]+ [\d:]+\] - \[SOURCE: Peer deadbeef \(([^[\]]*)\)\] - \[ACTION: State Update\]$/;
     const match = shape.exec(heading);
     assert.ok(match, `heading lost its canonical shape: ${heading}`);
     assert.ok(!match[1]!.includes("["), "brackets must be stripped from the label");
@@ -111,7 +123,7 @@ describe("audit attribution", () => {
   });
 
   it("keeps each entry on a single heading line", () => {
-    log.syncStatePatch("Peer", [{ op: "add", path: "/k", value: 1 }], { k: 1 }, PEER);
+    log.syncStateUpdate("Peer", ["k"], { k: 1 }, undefined, PEER);
     const headings = body()
       .split("\n")
       .filter((line) => line.startsWith("### ["));

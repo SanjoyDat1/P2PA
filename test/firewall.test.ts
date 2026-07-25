@@ -11,7 +11,9 @@ import { after, before, describe, it } from "node:test";
 import createTestnet from "hyperdht/testnet";
 import DHT from "hyperdht";
 import { P2PNode, describePeer, shouldBlockPeer } from "../src/p2p.js";
-import type { ContextState, PeerEnvelope } from "../src/types.js";
+import type { PeerEnvelope } from "../src/types.js";
+import { ContextStore } from "../src/store.js";
+import type { CrdtOp } from "../src/crdt.js";
 
 const KEY_A = "a1".repeat(32);
 const KEY_B = "b2".repeat(32);
@@ -94,11 +96,21 @@ describe("P2PNode firewall (live, local testnet)", () => {
     received: Array<{ envelope: PeerEnvelope; peer: string }>;
   }
 
-  function makeNode(options: {
+  /**
+ * Build stamped ops for a handshake fixture. The transport carries CRDT
+ * entries now, so a plain object is no longer a valid snapshot payload.
+ */
+function stampedOps(state: Record<string, string>): CrdtOp[] {
+  const store = new ContextStore("f".repeat(64));
+  for (const [key, value] of Object.entries(state)) store.setKey(key, value);
+  return store.export();
+}
+
+function makeNode(options: {
     seed: number;
     authMode: "strict" | "open";
     allow: string[];
-    state?: ContextState;
+    state?: Record<string, string>;
   }): Harness {
     const keyPair = DHT.keyPair(Buffer.alloc(32, options.seed));
     const allow = new Set(options.allow);
@@ -111,7 +123,7 @@ describe("P2PNode firewall (live, local testnet)", () => {
       bootstrap,
       isPeerAllowed: (key) => allow.has(key),
       lookupPeer: (key) => (allow.has(key) ? { label: `peer-${key.slice(0, 4)}` } : undefined),
-      getActiveState: () => options.state ?? {},
+      getActiveState: () => stampedOps(options.state ?? {}),
       onPeerMessage: (envelope, peer) => {
         received.push({ envelope, peer: describePeer(peer) });
       },
@@ -170,13 +182,13 @@ describe("P2PNode firewall (live, local testnet)", () => {
       seed: 11,
       authMode: "strict",
       allow: [bKey],
-      state: { mission: "from-a", _version: 1 },
+      state: { mission: "from-a" },
     });
     const b = makeNode({
       seed: 12,
       authMode: "strict",
       allow: [aKey],
-      state: { mission: "from-b", _version: 1 },
+      state: { mission: "from-b" },
     });
 
     try {
@@ -210,13 +222,13 @@ describe("P2PNode firewall (live, local testnet)", () => {
       seed: 21,
       authMode: "strict",
       allow: [],
-      state: { secret_plan: "do not leak", _version: 3 },
+      state: { secret_plan: "do not leak" },
     });
     const attacker = makeNode({
       seed: 22,
       authMode: "open",
       allow: [victimKey],
-      state: { evil: "takeover", _version: 99 },
+      state: { evil: "takeover" },
     });
 
     try {
@@ -253,8 +265,8 @@ describe("P2PNode firewall (live, local testnet)", () => {
   });
 
   it("open mode still connects an unlisted peer (backwards compatibility)", async () => {
-    const a = makeNode({ seed: 31, authMode: "open", allow: [], state: { k: "a", _version: 1 } });
-    const b = makeNode({ seed: 32, authMode: "open", allow: [], state: { k: "b", _version: 1 } });
+    const a = makeNode({ seed: 31, authMode: "open", allow: [], state: { k: "a" } });
+    const b = makeNode({ seed: 32, authMode: "open", allow: [], state: { k: "b" } });
 
     try {
       await connect([a, b]);

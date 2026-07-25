@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
 
-Stop copy-pasting prompts between agents. **P2PA** is a local-first [MCP](https://modelcontextprotocol.io) toolkit that lets multiple LLM agents (Cursor, Claude Code, Claude Desktop, or custom scripts) share structured context, pass messages, and resolve state conflicts over a serverless P2P network.
+Stop copy-pasting prompts between agents. **P2PA** is a local-first [MCP](https://modelcontextprotocol.io) toolkit that lets multiple LLM agents (Cursor, Claude Code, Claude Desktop, or custom scripts) share structured context, pass messages, and merge concurrent edits over a serverless P2P network.
 
 Built for founders and engineering teams who want multiplayer AI without leaving their IDE.
 
@@ -25,8 +25,8 @@ Multi-agent collaboration is still broken in three ways:
 
 - **Hyperswarm** — DHT discovery + NAT traversal. No central server.
 - **Key-based peer authentication** — Only allowlisted ed25519 keys can connect. No inbound access from a leaked topic.
-- **RFC 6902 JSON Patch** — Surgical updates instead of full context dumps.
-- **Versioned conflict detection** — Concurrent edits to the same state enqueue a collision for the local LLM to resolve.
+- **Per-key CRDT merge** — Every key carries its own hybrid logical clock. Two agents writing different keys never conflict; two agents writing the same key resolve to the same winner on every replica, with no arbitration step.
+- **Add-wins sets** — Concurrent appends to a list all survive, instead of one agent's entries overwriting the other's.
 - **Human-readable audit log** — Every change lands in `~/.p2pa/shared_context.md`, attributed to the peer that made it.
 
 ---
@@ -47,7 +47,7 @@ graph TD
         MCPB -->|Active State + Audit Trail| LogB["~/.p2pa/shared_context.md"]
     end
 
-    MCPA <-->|Hyperswarm · NDJSON · JSON Patch| MCPB
+    MCPA <-->|Hyperswarm · NDJSON · CRDT ops| MCPB
 ```
 
 **Two process modes (same on-disk state):**
@@ -153,7 +153,7 @@ Config and state live under **`~/.p2pa/`** (mode `0700`):
 |------|---------|
 | `config.json` | Pairing topic, auth mode, peer allowlist, optional doc link (`0600`) |
 | `identity.json` | This node's 32-byte identity seed (`0600`) — never share |
-| `shared_context.md` | Active State + Conflicts + Audit Trail |
+| `shared_context.md` | Active State + Replica State + Concurrent Updates + Audit Trail |
 | `daemon-error.log` | Daemon diagnostics (not mixed into MCP stdout) |
 
 Override the config directory with `P2PA_CONFIG_DIR` (must stay under your home directory).
@@ -261,35 +261,45 @@ Once connected, agents can call:
 
 | Tool | What it does |
 |------|----------------|
-| `push_context` | Set a top-level key, bump `_version`, sync markdown, broadcast a JSON Patch |
-| `patch_context` | Apply an RFC 6902 patch for surgical, low-token updates |
+| `push_context` | Set a top-level key and broadcast it |
+| `delete_context` | Tombstone a key so a stale replica cannot resurrect it |
+| `set_add` / `set_remove` | Add-wins set operations for lists two agents both append to |
 | `pull_context` | Read one key or the entire in-memory state |
 | `send_peer_message` | Send a text message into the peer’s audit trail |
-| `check_conflicts` | Inspect queued collisions before merging |
-| `resolve_conflict` | Resolve the oldest collision: `accept_peer`, `keep_local`, or `custom_merge` |
+| `check_conflicts` | List recent concurrent updates (already settled; informational) |
+| `override_context` | Impose your own values when the automatic winner is wrong by intent |
+| `sync_health` | Replica id, content hash, peer count — equal hashes mean equal state |
 | `read_context_history` | Read the last *N* lines of the local markdown log |
 | `doc_publish` | Push status / plan / agent_log to the linked Google Doc |
 | `doc_read_steering` | Read HUMAN directives (optional force poll) |
 | `doc_status` | Living-doc link + poll health (no secrets) |
 
-### Conflict flow
+### How merge works
 
-1. Each local mutation increments a Lamport-style `_version` clock and includes it in the broadcast patch.
-2. Peers apply only **strict successors** (`localVersion + 1`). Equal, missing, or gapped versions → **collision**.
-3. Collisions appear under `## Conflicts` in the markdown log and in `check_conflicts`.
-4. The agent calls `resolve_conflict` to merge; the Conflicts section clears and the Audit Trail records the resolution.
+1. Every local write stamps its key with a hybrid logical clock: wall time, a
+   counter, and this node's id.
+2. Peers merge each key independently. Writes to **different keys always merge** —
+   there is no document-wide version to contend over.
+3. Writes to the **same key** resolve by stamp order. The comparison is total and
+   identical on every replica, so all peers pick the same winner without talking
+   to each other.
+4. The losing write is recorded under `## Concurrent Updates` and surfaced by
+   `check_conflicts`. Nothing is blocked waiting on it.
+5. If the automatic winner is wrong by intent, `override_context` writes the value
+   you want; it out-stamps what it replaces and propagates normally.
 
----
+Stamps are bounded: an entry claiming a clock more than 24h ahead of local time is
+refused and recorded, so a peer cannot saturate a replica's clock or use a
+handshake snapshot to overwrite state it never held.
 
-## Local audit log
+Every update, snapshot handshake, peer message, and refusal is written to a human-readable markdown file at `~/.p2pa/shared_context.md`.
 
-Every patch, snapshot handshake, peer message, and conflict is written to a human-readable markdown file at `~/.p2pa/shared_context.md`.
+The file has four sections:
 
-The file has three sections:
-
-1. **Active State** — current shared JSON (including `_version`)
-2. **Conflicts** — pending collisions awaiting `resolve_conflict` (omitted when empty)
-3. **Audit Trail** — append-only history of patches, messages, and resolutions
+1. **Active State** — current shared JSON, plain and human-readable
+2. **Replica State** — the same document plus per-key stamps (machine-managed)
+3. **Concurrent Updates** — recent settled contention (omitted when empty)
+4. **Audit Trail** — append-only history of patches, messages, and resolutions
 
 Tail it during development:
 
@@ -322,7 +332,7 @@ npm install
 npm run build
 npm test                 # unit + integration suite (offline)
 npm run smoke            # Hyperswarm two-node sync (needs internet)
-npm run smoke:conflict   # versioned collision + resolve strategies
+npm run smoke:merge      # concurrent merge, same-key resolution, set adds
 npm run smoke:doc        # living-doc bridge (mock Google Docs, no keys)
 ```
 

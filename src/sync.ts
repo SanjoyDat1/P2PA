@@ -1,393 +1,341 @@
-import jsonpatch from "fast-json-patch";
-import type { Operation } from "fast-json-patch";
 import type { ContextStore } from "./store.js";
 import type { MarkdownLog } from "./markdown-log.js";
 import type { P2PNode } from "./p2p.js";
-import type { ConflictQueue } from "./conflicts.js";
-import type {
-  AuditPeer,
-  ContextState,
-  MergeStrategy,
-  Source,
-} from "./types.js";
+import type { ContentionLog } from "./conflicts.js";
+import type { CrdtOp, MergeResult } from "./crdt.js";
 import {
-  JsonPatchArraySchema,
+  CrdtOpArraySchema,
   MAX_PAYLOAD_BYTES,
-  PeerEnvelopeSchema,
-  VERSION_KEY,
-  extractPatchVersion,
-  isReservedKey,
-  readLocalVersion,
-  stripVersionOps,
-  toJsonValue,
+  PROTOCOL_VERSION,
+  type AuditPeer,
+  type ContextState,
+  type JsonValue,
+  type Source,
 } from "./types.js";
-
-const { compare, deepClone } = jsonpatch;
+import { nodeIdFromPublicKey } from "./hlc.js";
 
 export interface SyncServices {
   store: ContextStore;
   log: MarkdownLog;
   p2p?: P2PNode;
-  conflicts?: ConflictQueue;
+  contention?: ContentionLog;
 }
 
-export type ApplyPatchResult =
-  | { ok: true; ops: Operation[] }
+export type ApplyResult =
+  | { ok: true; ops: CrdtOp[] }
   | { ok: false; error: string };
 
-export type ApplySnapshotResult =
-  | { ok: true; state: ContextState }
-  | { ok: false; error: string };
-
-export type InboundPatchResult =
-  | { status: "applied"; ops: Operation[] }
-  | { status: "collision"; conflictId: string; localVersion: number; peerVersion: number | null }
-  | { status: "rejected"; error: string };
-
-export type ResolveResult =
-  | { ok: true; strategy: MergeStrategy; conflictId: string; ops: Operation[] }
-  | { ok: false; error: string };
+export interface InboundSummary {
+  applied: number;
+  ignored: number;
+  contended: number;
+  rejected: number;
+  rejections: string[];
+}
 
 /**
- * Local mutation path: run `mutate`, bump `_version` only if state changed,
- * audit, and broadcast.
+ * Run a local mutation, persist, and broadcast the resulting ops.
+ *
+ * The mutation hands back the ops it produced rather than the sync layer
+ * diffing before against after: a CRDT write already knows which keys it
+ * touched, and a structural diff cannot recover the stamps that make merge
+ * deterministic on the other end.
  */
 export function commitLocalMutation(
   services: SyncServices,
-  mutate: (store: ContextStore) => void,
-): ApplyPatchResult {
-  const before = services.store.snapshot();
+  mutate: (store: ContextStore) => CrdtOp[] | CrdtOp | null,
+): ApplyResult {
+  let produced: CrdtOp[];
   try {
-    mutate(services.store);
+    const result = mutate(services.store);
+    produced = result === null ? [] : Array.isArray(result) ? result : [result];
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, error: message };
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 
-  const mid = services.store.snapshot();
-  const provisional = compare(before, mid) as Operation[];
-  if (provisional.length === 0) {
-    return { ok: true, ops: [] };
-  }
+  if (produced.length === 0) return { ok: true, ops: [] };
 
-  const nextVersion = services.store.getVersion() + 1;
-  services.store.setVersion(nextVersion);
-  const after = services.store.snapshot();
-  const ops = compare(before, after) as Operation[];
-
-  const serialized = JSON.stringify(ops);
-  if (serialized.length > MAX_PAYLOAD_BYTES) {
-    services.store.replaceAll(before);
+  if (JSON.stringify(produced).length > MAX_PAYLOAD_BYTES) {
     return {
       ok: false,
-      error: `Patch exceeds max size of ${MAX_PAYLOAD_BYTES} bytes`,
+      error: `Update exceeds max size of ${MAX_PAYLOAD_BYTES} bytes`,
     };
   }
 
-  services.log.syncStatePatch("Local", ops, after);
-  if (services.p2p) {
-    services.p2p.broadcast({ type: "patch", ops });
-  }
-  return { ok: true, ops };
-}
-
-/**
- * Apply a validated RFC 6902 patch without auto-bumping `_version`
- * (used for peer applies where the patch already carries version).
- */
-export function applyStatePatch(
-  services: SyncServices,
-  ops: Operation[],
-  source: Source,
-  broadcast: boolean,
-  peer?: AuditPeer,
-): ApplyPatchResult {
-  const parsed = JsonPatchArraySchema.safeParse(ops);
-  if (!parsed.success) {
-    return { ok: false, error: parsed.error.message };
-  }
-
-  const validated = parsed.data;
-  const serialized = JSON.stringify(validated);
-  if (serialized.length > MAX_PAYLOAD_BYTES) {
-    return {
-      ok: false,
-      error: `Patch exceeds max size of ${MAX_PAYLOAD_BYTES} bytes`,
-    };
-  }
-
-  try {
-    services.store.applyOps(validated);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, error: `applyPatch failed: ${message}` };
-  }
-
-  services.log.syncStatePatch(source, validated, services.store.snapshot(), peer);
-
-  if (broadcast && services.p2p) {
-    services.p2p.broadcast({ type: "patch", ops: validated });
-  }
-
-  return { ok: true, ops: validated };
-}
-
-/**
- * Inbound peer patch with collision detection against local `_version`.
- */
-export function handleInboundPatch(
-  services: SyncServices,
-  ops: Operation[],
-  peer?: AuditPeer,
-): InboundPatchResult {
-  const parsed = JsonPatchArraySchema.safeParse(ops);
-  if (!parsed.success) {
-    return { status: "rejected", error: parsed.error.message };
-  }
-
-  const validated = parsed.data;
-  const peerVersion = extractPatchVersion(validated);
-  const localVersion = services.store.getVersion();
-
-  // Strict successor only — equal/lower OR gaps → collision queue.
-  const isCollision =
-    peerVersion === null ||
-    peerVersion <= localVersion ||
-    peerVersion > localVersion + 1;
-
-  if (isCollision) {
-    if (!services.conflicts) {
-      return {
-        status: "rejected",
-        error: "collision detected but conflict queue is unavailable",
-      };
-    }
-
-    const item = services.conflicts.enqueue({
-      peerOps: validated,
-      peerVersion,
-      localState: services.store.snapshot(),
-      localVersion,
-    });
-
-    if (!item) {
-      console.error(
-        `[p2pa] COLLISION at local v=${localVersion} peer v=${peerVersion ?? "missing"} — queue full, dropping`,
-      );
-      return {
-        status: "rejected",
-        error: "conflict queue is full",
-      };
-    }
-
-    console.error(
-      `[p2pa] COLLISION DETECTED at version ${localVersion} (peer attempted ${peerVersion ?? "missing"}) id=${item.id}`,
-    );
-
-    services.conflicts.syncMarkdown(services.log);
-    services.log.syncMarkdownLog({
-      source: "Peer",
-      peer,
-      action: "Collision Detected",
-      localVersion,
-      peerVersion,
-      conflictId: item.id,
-    });
-
-    return {
-      status: "collision",
-      conflictId: item.id,
-      localVersion,
-      peerVersion,
-    };
-  }
-
-  const beforeApply = services.store.snapshot();
-  const applied = applyStatePatch(services, validated, "Peer", false, peer);
-  if (!applied.ok) {
-    return { status: "rejected", error: applied.error };
-  }
-
-  // Post-condition: peer may not smuggle a different clock past the gate.
-  if (services.store.getVersion() !== localVersion + 1) {
-    services.store.replaceAll(beforeApply);
-    return {
-      status: "rejected",
-      error: "peer patch altered _version inconsistently; rolled back",
-    };
-  }
-
-  return { status: "applied", ops: applied.ops };
-}
-
-/**
- * Resolve the oldest queued conflict via LLM-chosen strategy.
- */
-export function resolveConflict(
-  services: SyncServices,
-  strategy: MergeStrategy,
-  customStateRaw?: string,
-): ResolveResult {
-  if (!services.conflicts) {
-    return { ok: false, error: "conflict queue is unavailable" };
-  }
-
-  const item = services.conflicts.shift();
-  if (!item) {
-    return { ok: false, error: "No conflicts in queue." };
-  }
-
-  const before = services.store.snapshot();
-  let detail: string;
-
-  try {
-    const baseVersion =
-      typeof before[VERSION_KEY] === "number"
-        ? (before[VERSION_KEY] as number)
-        : 0;
-
-    if (strategy === "accept_peer") {
-      const peerOps = stripVersionOps(item.peerOps);
-      if (peerOps.length > 0) {
-        services.store.applyOps(peerOps);
-      }
-      services.store.setVersion(baseVersion + 1);
-      detail = `Accepted peer patch (${peerOps.length} op(s)); version → ${services.store.getVersion()}`;
-    } else if (strategy === "keep_local") {
-      services.store.setVersion(baseVersion + 1);
-      detail = `Kept local state; version → ${services.store.getVersion()}`;
-    } else {
-      // custom_merge
-      if (customStateRaw === undefined || customStateRaw.trim().length === 0) {
-        services.conflicts.requeue(item);
-        services.conflicts.syncMarkdown(services.log);
-        return {
-          ok: false,
-          error: "custom_merge requires custom_state (JSON object string)",
-        };
-      }
-      if (customStateRaw.length > MAX_PAYLOAD_BYTES) {
-        services.conflicts.requeue(item);
-        services.conflicts.syncMarkdown(services.log);
-        return { ok: false, error: "custom_state exceeds max payload size" };
-      }
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(customStateRaw);
-      } catch {
-        services.conflicts.requeue(item);
-        services.conflicts.syncMarkdown(services.log);
-        return { ok: false, error: "custom_state is not valid JSON" };
-      }
-
-      if (
-        parsed === null ||
-        typeof parsed !== "object" ||
-        Array.isArray(parsed)
-      ) {
-        services.conflicts.requeue(item);
-        services.conflicts.syncMarkdown(services.log);
-        return { ok: false, error: "custom_state must be a JSON object" };
-      }
-
-      const merged = deepClone(before) as ContextState;
-      for (const [key, value] of Object.entries(
-        parsed as Record<string, unknown>,
-      )) {
-        if (isReservedKey(key) || key === VERSION_KEY) continue;
-        merged[key] = toJsonValue(value);
-      }
-      merged[VERSION_KEY] = baseVersion + 1;
-      services.store.replaceAll(merged);
-      detail = `Custom merge applied; version → ${baseVersion + 1}`;
-    }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    services.conflicts.requeue(item);
-    services.conflicts.syncMarkdown(services.log);
-    return { ok: false, error: message };
-  }
-
-  const after = services.store.snapshot();
-  const ops = compare(before, after) as Operation[];
-
-  services.log.syncMarkdownLog(
-    {
-      source: "Local",
-      action: "Conflict Resolution",
-      strategy,
-      conflictId: item.id,
-      detail,
-    },
-    after,
+  services.log.syncStateUpdate(
+    "Local",
+    produced.map((op) => op.key),
+    services.store.snapshot(),
+    services.store.export(),
   );
-
-  // Also emit a State Patch audit when there are ops to broadcast.
-  if (ops.length > 0) {
-    services.log.syncStatePatch("Local", ops, after);
-    if (services.p2p) {
-      services.p2p.broadcast({ type: "patch", ops });
-    }
-  }
-
-  services.conflicts.syncMarkdown(services.log);
-  return { ok: true, strategy, conflictId: item.id, ops };
+  broadcastUpdate(services, produced);
+  return { ok: true, ops: produced };
 }
 
 /**
- * Replace local shared state from a peer handshake snapshot.
- * Never rebroadcasts. Empty snapshots do not wipe non-empty local state.
+ * Merge ops that arrived from a peer.
+ *
+ * A peer can only move the keys it names, and only by presenting a stamp that
+ * beats the one already on that key. Nothing inbound replaces the document, and
+ * nothing inbound stalls the merge of anything else — a refused op is recorded
+ * and skipped rather than holding up its neighbours.
+ */
+export function handleInboundOps(
+  services: SyncServices,
+  ops: CrdtOp[],
+  source: Source,
+  peer?: AuditPeer,
+  /**
+   * Authenticated public key of the sender.
+   *
+   * A direct update is the sender's own write, so its stamps must carry the
+   * sender's node id. Without this check a peer can stamp with a victim's id:
+   * the overwrite then looks like the victim's own work, so it is neither
+   * reported as contended nor recorded, and a replayed stamp can be used to
+   * pin a key. Snapshots legitimately relay third-party stamps and are not
+   * bound this way — that is why they stay merge-only and never authoritative.
+   */
+  senderPublicKey?: string,
+): InboundSummary {
+  if (senderPublicKey !== undefined) {
+    const expected = nodeIdFromPublicKey(senderPublicKey);
+    const forged = ops.filter((op) => op?.entry?.hlc?.n !== expected);
+    if (forged.length > 0) {
+      const summary: InboundSummary = {
+        applied: 0,
+        ignored: 0,
+        contended: 0,
+        rejected: forged.length,
+        rejections: ["stamp does not match the sending peer's identity"],
+      };
+      recordRejection(
+        services,
+        summary,
+        source,
+        peer,
+        forged.map((op) => op?.key ?? "?"),
+      );
+      return summary;
+    }
+  }
+
+  const parsed = CrdtOpArraySchema.safeParse(ops);
+  if (!parsed.success) {
+    const summary: InboundSummary = {
+      applied: 0,
+      ignored: 0,
+      contended: 0,
+      rejected: ops.length,
+      rejections: [parsed.error.message],
+    };
+    recordRejection(
+      services,
+      summary,
+      source,
+      peer,
+      ops.map((op) => op?.key ?? "?"),
+    );
+    return summary;
+  }
+
+  return absorb(services, services.store.merge(parsed.data), source, peer);
+}
+
+/**
+ * Merge a peer's handshake snapshot.
+ *
+ * The counter protocol took a snapshot whole whenever the sender claimed a
+ * clock at least as high as the local one, then replaced local state with it.
+ * That handed any connected peer a way to blank the document, and — with a
+ * stamp near the integer ceiling — to wedge the receiver's clock permanently.
+ * A snapshot is now merged key by key under the same rules as any other update:
+ * it wins only the keys it can out-stamp, stamps beyond the accepted skew are
+ * refused outright, and local keys the sender never mentioned are untouched.
  */
 export function applyPeerSnapshot(
   services: SyncServices,
-  state: ContextState,
+  ops: CrdtOp[],
   source: Source,
   peer?: AuditPeer,
-): ApplySnapshotResult {
-  const parsed = PeerEnvelopeSchema.safeParse({ type: "snapshot", state });
-  if (!parsed.success || parsed.data.type !== "snapshot") {
-    return {
-      ok: false,
-      error: parsed.success ? "invalid snapshot" : parsed.error.message,
-    };
+): InboundSummary {
+  if (ops.length === 0) {
+    return { applied: 0, ignored: 0, contended: 0, rejected: 0, rejections: [] };
   }
 
-  const clean: ContextState = {};
-  for (const [key, value] of Object.entries(parsed.data.state)) {
-    if (isReservedKey(key)) continue;
-    clean[key] = value;
+  // A snapshot legitimately relays stamps authored by third parties, so its
+  // entries cannot be bound to the sender the way a direct update's are. What
+  // it may never carry is *our own* node id: that is not relaying, it is a peer
+  // writing as us — which would sail past the contention check (the stamp looks
+  // locally authored) and leave no record that anything was overwritten.
+  const impersonating = ops.filter(
+    (op) => op?.entry?.hlc?.n === services.store.nodeId,
+  );
+  const relayed = ops.filter((op) => op?.entry?.hlc?.n !== services.store.nodeId);
+
+  const appliedKeys: string[] = [];
+  const results = services.store.merge(relayed);
+  for (const result of results) {
+    if (result.status === "applied" || result.status === "contended") {
+      appliedKeys.push(result.key);
+    }
+  }
+  const summary = absorb(services, results, source, peer, { snapshot: true });
+
+  if (impersonating.length > 0) {
+    summary.rejected += impersonating.length;
+    summary.rejections.push("snapshot entry stamped with this node's identity");
+    recordRejection(
+      services,
+      summary,
+      source,
+      peer,
+      impersonating.map((op) => op?.key ?? "?"),
+    );
+  }
+  services.log.syncSnapshot(
+    source,
+    summary.applied,
+    summary.ignored,
+    peer,
+    services.store.snapshot(),
+    services.store.export(),
+  );
+  if (summary.applied > 0) {
+    services.log.syncMarkdownLog({
+      source,
+      peer,
+      action: "State Update",
+      keys: appliedKeys.slice(0, 50),
+    });
+  }
+  return summary;
+}
+
+/** Fold merge results into audit entries, contention records, and a summary. */
+function absorb(
+  services: SyncServices,
+  results: MergeResult[],
+  source: Source,
+  peer: AuditPeer | undefined,
+  options: { snapshot?: boolean } = {},
+): InboundSummary {
+  const summary: InboundSummary = {
+    applied: 0,
+    ignored: 0,
+    contended: 0,
+    rejected: 0,
+    rejections: [],
+  };
+  const touched: string[] = [];
+  const refused: string[] = [];
+
+  for (const result of results) {
+    if (result.status === "applied") {
+      summary.applied += 1;
+      touched.push(result.key);
+      continue;
+    }
+    if (result.status === "ignored") {
+      summary.ignored += 1;
+      continue;
+    }
+    if (result.status === "rejected") {
+      summary.rejected += 1;
+      refused.push(result.key);
+      if (result.reason && !summary.rejections.includes(result.reason)) {
+        summary.rejections.push(result.reason);
+      }
+      continue;
+    }
+
+    // contended: merge already settled it, identically on both replicas.
+    summary.contended += 1;
+    summary.applied += 1;
+    touched.push(result.key);
+    services.contention?.record({
+      key: result.key,
+      previousNode: result.previousNode ?? "unknown",
+      peerFingerprint: peer?.fingerprint ?? null,
+      winningValue: services.store.get(result.key),
+    });
+    services.log.syncMarkdownLog({
+      source,
+      peer,
+      action: "Concurrent Update",
+      key: result.key,
+      previousNode: result.previousNode ?? "unknown",
+    });
   }
 
-  const peerVersion = readLocalVersion(clean);
-  const localVersion = services.store.getVersion();
-  if (peerVersion < localVersion) {
-    return {
-      ok: false,
-      error: `refusing snapshot clock downgrade (peer v=${peerVersion} < local v=${localVersion})`,
-    };
+  if (touched.length > 0 && options.snapshot !== true) {
+    services.log.syncStateUpdate(
+      source,
+      touched,
+      services.store.snapshot(),
+      services.store.export(),
+      peer,
+    );
   }
-
-  const incomingEmpty =
-    Object.keys(clean).filter((k) => k !== VERSION_KEY).length === 0;
-  const localKeys = Object.keys(services.store.snapshot()).filter(
-    (k) => k !== VERSION_KEY,
-  ).length;
-  if (incomingEmpty && localKeys > 0) {
-    return {
-      ok: false,
-      error: "refusing empty snapshot overwrite of non-empty local state",
-    };
+  if (refused.length > 0) {
+    recordRejection(services, summary, source, peer, refused);
   }
+  if (summary.contended > 0 && services.contention) {
+    services.contention.syncMarkdown(services.log);
+  }
+  return summary;
+}
 
-  services.store.replaceAll(clean);
-  services.log.syncSnapshot(source, services.store.snapshot(), peer);
-  return { ok: true, state: services.store.snapshot() };
+/** Refusals go to the audit trail, not only to stderr. */
+function recordRejection(
+  services: SyncServices,
+  summary: InboundSummary,
+  source: Source,
+  peer: AuditPeer | undefined,
+  keys: string[],
+): void {
+  services.log.syncMarkdownLog({
+    source,
+    peer,
+    action: "Rejected Update",
+    reason: summary.rejections.join("; ") || "invalid update",
+    keys: keys.slice(0, 20),
+  });
 }
 
 /**
- * Record a peer/local message in the Audit Trail and optionally broadcast.
+ * Overwrite keys with agent-chosen values, overriding a settled merge.
+ *
+ * The deterministic winner is correct by construction but not always correct by
+ * intent; this is the escape hatch. It is an ordinary local write, so it
+ * out-stamps what it replaces and converges like anything else.
  */
+export function overrideKeys(
+  services: SyncServices,
+  values: Record<string, JsonValue>,
+  detail: string,
+): ApplyResult {
+  const keys = Object.keys(values);
+  if (keys.length === 0) {
+    return { ok: false, error: "no keys supplied" };
+  }
+
+  const result = commitLocalMutation(services, (store) =>
+    keys.map((key) => store.setKey(key, values[key] as JsonValue)),
+  );
+  if (!result.ok) return result;
+
+  for (const key of keys) services.contention?.clearKey(key);
+  services.contention?.syncMarkdown(services.log);
+  services.log.syncMarkdownLog({
+    source: "Local",
+    action: "Override",
+    keys,
+    detail,
+  });
+  return result;
+}
+
+/** Record a peer/local message in the Audit Trail and optionally broadcast. */
 export function recordMessage(
   services: SyncServices,
   text: string,
@@ -397,6 +345,16 @@ export function recordMessage(
 ): void {
   services.log.syncMessage(source, text, peer);
   if (broadcast && services.p2p) {
-    services.p2p.broadcast({ type: "message", text });
+    services.p2p.broadcast({ type: "message", v: PROTOCOL_VERSION, text });
   }
+}
+
+function broadcastUpdate(services: SyncServices, ops: CrdtOp[]): void {
+  if (!services.p2p || ops.length === 0) return;
+  services.p2p.broadcast({ type: "update", v: PROTOCOL_VERSION, ops });
+}
+
+/** Current view of the document, for callers that only need plain JSON. */
+export function activeState(services: SyncServices): ContextState {
+  return services.store.snapshot();
 }

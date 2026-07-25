@@ -24,11 +24,11 @@ import { createAllowlist } from "./allowlist.js";
 import { ContextStore } from "./store.js";
 import { MarkdownLog } from "./markdown-log.js";
 import { P2PNode, describePeer, type PeerIdentity } from "./p2p.js";
-import { ConflictQueue } from "./conflicts.js";
+import { ContentionLog } from "./conflicts.js";
 import { createMcpServer, startMcpServer } from "./mcp-server.js";
 import {
   applyPeerSnapshot,
-  handleInboundPatch,
+  handleInboundOps,
   recordMessage,
 } from "./sync.js";
 import { DocBridge } from "./doc/bridge.js";
@@ -85,7 +85,7 @@ function tryCreateDocBridge(services: {
   store: ContextStore;
   log: MarkdownLog;
   p2p?: P2PNode;
-  conflicts?: ConflictQueue;
+  contention?: ContentionLog;
 }): DocBridge | undefined {
   const config = readConfig();
   const doc = config?.doc;
@@ -134,18 +134,31 @@ async function main(): Promise<void> {
 
   const options = resolveRuntimeOptions();
 
-  const store = new ContextStore();
+  // Identity first: the node's public key seeds the clock that stamps every
+  // write, and stamps are what let concurrent edits merge deterministically.
+  const identity = loadOrCreateIdentity();
+
+  const store = new ContextStore(identity.publicKeyHex);
   const log = new MarkdownLog(options.contextFile);
-  const conflicts = new ConflictQueue();
+  const contention = new ContentionLog();
   log.ensureInitialized();
 
-  const hydrated = log.readActiveState();
-  store.replaceAll(hydrated);
-  console.error(
-    `[p2pa] Markdown log: ${log.path} (hydrated ${Object.keys(hydrated).length} key(s), _version=${store.getVersion()})`,
-  );
+  const replica = log.readReplicaState();
+  if (replica.length > 0) {
+    store.load(replica);
+    console.error(
+      `[p2pa] Markdown log: ${log.path} (restored ${replica.length} stamped key(s), state=${store.stateHash()})`,
+    );
+  } else {
+    // No stamps on disk: either a fresh install or a document written by the
+    // retired counter protocol. Re-stamp locally — those documents carry no
+    // causal history worth preserving.
+    const seeded = store.hydrateLegacy(log.readActiveState());
+    console.error(
+      `[p2pa] Markdown log: ${log.path} (seeded ${seeded} unstamped key(s), state=${store.stateHash()})`,
+    );
+  }
 
-  const identity = loadOrCreateIdentity();
   const { mode: authMode, legacy } = resolveAuthMode(readConfig());
   const allowlist = createAllowlist();
 
@@ -175,9 +188,9 @@ async function main(): Promise<void> {
     authMode,
     isPeerAllowed: (pubkey) => allowlist.isAllowed(pubkey),
     lookupPeer: (pubkey) => allowlist.lookup(pubkey),
-    getActiveState: () => store.snapshot(),
+    getActiveState: () => store.export(),
     onPeerMessage: (envelope: PeerEnvelope, peer: PeerIdentity) => {
-      handlePeerEnvelope({ store, log, conflicts }, envelope, peer);
+      handlePeerEnvelope({ store, log, contention }, envelope, peer);
     },
   });
 
@@ -195,7 +208,7 @@ async function main(): Promise<void> {
 
   await p2p.start();
 
-  docBridge = tryCreateDocBridge({ store, log, p2p, conflicts });
+  docBridge = tryCreateDocBridge({ store, log, p2p, contention });
 
   if (daemon) {
     console.error(
@@ -225,7 +238,7 @@ async function main(): Promise<void> {
     store,
     log,
     p2p,
-    conflicts,
+    contention,
     doc: docBridge,
   });
   await startMcpServer(mcp);
@@ -253,7 +266,7 @@ function handlePeerEnvelope(
   services: {
     store: ContextStore;
     log: MarkdownLog;
-    conflicts: ConflictQueue;
+    contention: ContentionLog;
   },
   envelope: PeerEnvelope,
   peer: PeerIdentity,
@@ -265,35 +278,32 @@ function handlePeerEnvelope(
   };
 
   if (envelope.type === "snapshot") {
-    const result = applyPeerSnapshot(services, envelope.state, "Peer", audit);
-    if (!result.ok) {
-      console.error(
-        `[p2pa] rejected peer snapshot from ${remoteLabel}: ${result.error}`,
-      );
-      return;
-    }
+    const summary = applyPeerSnapshot(services, envelope.ops, "Peer", audit);
     console.error(
-      `[p2pa] peer snapshot from ${remoteLabel}: ${Object.keys(result.state).length} key(s), _version=${services.store.getVersion()}`,
+      `[p2pa] peer snapshot from ${remoteLabel}: ${summary.applied} applied, ` +
+        `${summary.ignored} already current, ${summary.rejected} refused, ` +
+        `state=${services.store.stateHash()}`,
     );
     return;
   }
 
-  if (envelope.type === "patch") {
-    const result = handleInboundPatch(services, envelope.ops, audit);
-    if (result.status === "collision") {
+  if (envelope.type === "update") {
+    const summary = handleInboundOps(
+      services,
+      envelope.ops,
+      "Peer",
+      audit,
+      peer.pubkey ?? undefined,
+    );
+    if (summary.rejected > 0) {
       console.error(
-        `[p2pa] queued collision ${result.conflictId} from ${remoteLabel}`,
+        `[p2pa] refused ${summary.rejected} op(s) from ${remoteLabel}: ` +
+          `${summary.rejections.join("; ")}`,
       );
-      return;
-    }
-    if (result.status === "rejected") {
-      console.error(
-        `[p2pa] rejected peer patch from ${remoteLabel}: ${result.error}`,
-      );
-      return;
     }
     console.error(
-      `[p2pa] peer patch from ${remoteLabel}: ${result.ops.length} op(s), _version=${services.store.getVersion()}`,
+      `[p2pa] peer update from ${remoteLabel}: ${summary.applied} applied, ` +
+        `${summary.contended} contended, state=${services.store.stateHash()}`,
     );
     return;
   }

@@ -18,10 +18,10 @@ const PUBKEY_HEX = new RegExp(`^[0-9a-f]{${PUBKEY_BYTES * 2}}$`);
 const SEED_HEX = new RegExp(`^[0-9a-f]{${IDENTITY_SEED_BYTES * 2}}$`);
 
 /** Control characters (C0 + DEL) — stripped from peer-supplied labels. */
-const CONTROL_CHARS = new RegExp("[\\u0000-\\u001f\\u007f]", "g");
+const CONTROL_CHARS = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]", "g");
 
 /** Characters that could forge Markdown or CLI structure in the audit trail. */
-const STRUCTURAL_CHARS = /[`*_[\]()<>|\\]/g;
+const STRUCTURAL_CHARS = /[`*_[\]()<>|\\#]/g;
 
 /** First 8 hex chars of a public key — safe to log, safe to show in the UI. */
 export function shortFingerprint(publicKeyHex: string): string {

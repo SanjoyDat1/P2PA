@@ -191,9 +191,9 @@ export class DocBridge {
         docRevision: hash,
       };
 
-      const result = commitLocalMutation(this.services, (store) => {
-        store.setKey(STEERING_KEY, toJsonValue(value));
-      });
+      const result = commitLocalMutation(this.services, (store) =>
+        store.setKey(STEERING_KEY, toJsonValue(value)),
+      );
       if (!result.ok) {
         console.error(`[p2pa:doc] failed to commit steering: ${result.error}`);
         // Do not advance lastHumanHash — retry on next poll.

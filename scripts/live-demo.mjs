@@ -5,10 +5,10 @@
 import { ContextStore } from "../dist/store.js";
 import { MarkdownLog } from "../dist/markdown-log.js";
 import { P2PNode, describePeer } from "../dist/p2p.js";
-import { ConflictQueue } from "../dist/conflicts.js";
+import { ContentionLog } from "../dist/conflicts.js";
 import {
   commitLocalMutation,
-  handleInboundPatch,
+  handleInboundOps,
   recordMessage,
   applyPeerSnapshot,
 } from "../dist/sync.js";
@@ -24,15 +24,15 @@ mkdirSync(dirB, { recursive: true });
 const pathA = join(dirA, "shared_context.md");
 const pathB = join(dirB, "shared_context.md");
 
-function handle(store, log, conflicts) {
+function handle(store, log, contention) {
   return (envelope, peer) => {
     const audit = { fingerprint: peer.fingerprint, label: peer.label };
     if (envelope.type === "snapshot") {
-      applyPeerSnapshot({ store, log, conflicts }, envelope.state, "Peer", audit);
-    } else if (envelope.type === "patch") {
-      handleInboundPatch({ store, log, conflicts }, envelope.ops, audit);
+      applyPeerSnapshot({ store, log, contention }, envelope.ops, "Peer", audit);
+    } else if (envelope.type === "update") {
+      handleInboundOps({ store, log, contention }, envelope.ops, "Peer", audit);
     } else {
-      recordMessage({ store, log, conflicts }, envelope.text, "Peer", false, audit);
+      recordMessage({ store, log, contention }, envelope.text, "Peer", false, audit);
     }
     console.error(`[demo] received ${envelope.type} from ${describePeer(peer)}`);
   };
@@ -42,8 +42,8 @@ const storeA = new ContextStore();
 const storeB = new ContextStore();
 const logA = new MarkdownLog(pathA);
 const logB = new MarkdownLog(pathB);
-const conflictsA = new ConflictQueue();
-const conflictsB = new ConflictQueue();
+const contentionA = new ContentionLog();
+const contentionB = new ContentionLog();
 logA.ensureInitialized();
 logB.ensureInitialized();
 
@@ -53,14 +53,14 @@ logB.ensureInitialized();
 const a = new P2PNode({
   topic,
   authMode: "open",
-  getActiveState: () => storeA.snapshot(),
-  onPeerMessage: handle(storeA, logA, conflictsA),
+  getActiveState: () => storeA.export(),
+  onPeerMessage: handle(storeA, logA, contentionA),
 });
 const b = new P2PNode({
   topic,
   authMode: "open",
-  getActiveState: () => storeB.snapshot(),
-  onPeerMessage: handle(storeB, logB, conflictsB),
+  getActiveState: () => storeB.export(),
+  onPeerMessage: handle(storeB, logB, contentionB),
 });
 
 await a.start();
@@ -76,17 +76,19 @@ await new Promise((r) => setTimeout(r, 500));
 
 console.error("[demo] Agent A pushes project + note ...");
 commitLocalMutation(
-  { store: storeA, log: logA, p2p: a, conflicts: conflictsA },
+  { store: storeA, log: logA, p2p: a, contention: contentionA },
   (s) => {
-    s.setKey("project", "P2PA");
-    s.setKey("note", "hello from machine A");
+    return [
+      s.setKey("project", "P2PA"),
+      s.setKey("note", "hello from machine A"),
+    ];
   },
 );
 await new Promise((r) => setTimeout(r, 1000));
 
 console.error("[demo] Agent B sends a peer message ...");
 recordMessage(
-  { store: storeB, log: logB, p2p: b, conflicts: conflictsB },
+  { store: storeB, log: logB, p2p: b, contention: contentionB },
   "Hey A — I see your context!",
   "Local",
   true,
@@ -95,9 +97,9 @@ await new Promise((r) => setTimeout(r, 1000));
 
 console.error("[demo] Agent B sets status=synced ...");
 commitLocalMutation(
-  { store: storeB, log: logB, p2p: b, conflicts: conflictsB },
+  { store: storeB, log: logB, p2p: b, contention: contentionB },
   (s) => {
-    s.setKey("status", "synced");
+    return s.setKey("status", "synced");
   },
 );
 await new Promise((r) => setTimeout(r, 1000));

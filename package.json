@@ -1,7 +1,7 @@
 {
   "name": "p2pa",
-  "version": "0.6.0",
-  "description": "P2PA — headless P2P context synchronization for local AI agents (MCP + Hyperswarm + JSON Patch)",
+  "version": "0.7.0",
+  "description": "P2PA \u2014 headless P2P context synchronization for local AI agents (MCP + Hyperswarm + JSON Patch)",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -31,8 +31,8 @@
     "typecheck": "tsc -p tsconfig.check.json",
     "test": "tsx --test --test-concurrency=1 test/*.test.ts",
     "smoke": "tsx scripts/smoke-p2p.ts",
-    "smoke:conflict": "tsx scripts/smoke-conflict.ts",
-    "smoke:doc": "tsx scripts/smoke-doc.ts"
+    "smoke:doc": "tsx scripts/smoke-doc.ts",
+    "smoke:merge": "tsx scripts/smoke-merge.ts"
   },
   "engines": {
     "node": ">=18"

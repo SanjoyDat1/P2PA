@@ -194,8 +194,8 @@ async function smokeBridge(): Promise<void> {
     5_000,
     "initial steering from template HUMAN",
   );
-  const versionAfterSeed = store.getVersion();
-  assert(versionAfterSeed >= 1, "version bumped after seed steering");
+  const hashAfterSeed = store.stateHash();
+  assert(hashAfterSeed.length > 0, "state hashed after seed steering");
 
   // Inbound: simulate human edit → steering via commitLocalMutation
   const title = extractDocTitle(afterPublish);
@@ -222,15 +222,15 @@ async function smokeBridge(): Promise<void> {
     steering !== null && steering.text.includes("Do not touch billing"),
     "inbound steering text",
   );
-  assert(store.getVersion() > versionAfterSeed, "version bump after human steering");
+  assert(store.stateHash() !== hashAfterSeed, "state changed after human steering");
 
   const md = readFileSync(LOG_PATH, "utf8");
   assert(md.includes("Do not touch billing"), "Active State markdown has steering");
 
   // Unchanged HUMAN must not bump version again
-  const versionStable = store.getVersion();
+  const hashStable = store.stateHash();
   await sleep(500);
-  assert(store.getVersion() === versionStable, "unchanged HUMAN does not re-commit");
+  assert(store.stateHash() === hashStable, "unchanged HUMAN does not re-commit");
 
   // Force refresh path
   const refreshed = await bridge.refreshSteering();
@@ -264,7 +264,7 @@ async function smokeBridge(): Promise<void> {
   assert(bridge.getStatus().polling === false, "getStatus polling false after stop");
 
   // Restart: same HUMAN must not bump _version again
-  const versionBeforeRestart = store.getVersion();
+  const hashBeforeRestart = store.stateHash();
   const bridge2 = new DocBridge({
     documentId: created.documentId,
     url: created.url,
@@ -275,7 +275,7 @@ async function smokeBridge(): Promise<void> {
   bridge2.start();
   await sleep(500);
   assert(
-    store.getVersion() === versionBeforeRestart,
+    store.stateHash() === hashBeforeRestart,
     "restart does not re-commit identical steering",
   );
   bridge2.stop();

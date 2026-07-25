@@ -10,25 +10,33 @@ import {
   fstatSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Operation } from "fast-json-patch";
+import type { CrdtOp } from "./crdt.js";
+import { sanitizeLabel } from "./peer-key.js";
 import type {
   AuditEntry,
   AuditPeer,
-  ConflictItem,
+  ContentionItem,
   ContextState,
   Source,
 } from "./types.js";
 
 const TITLE = "# P2PA Shared Context";
 const ACTIVE_HEADING = "## Active State";
-const CONFLICTS_HEADING = "## Conflicts";
+const REPLICA_HEADING = "## Replica State";
+const CONFLICTS_HEADING = "## Concurrent Updates";
 const AUDIT_HEADING = "## Audit Trail";
 
 /**
  * Sectioned Markdown persistence:
- * - ## Active State  — rewritten JSON snapshot on every state change
- * - ## Conflicts     — rewritten from the in-memory conflict queue
- * - ## Audit Trail   — append-only patch / message / resolution history
+ * - ## Active State       — plain JSON view, for humans and for `git diff`
+ * - ## Replica State      — the same document plus per-key CRDT stamps
+ * - ## Concurrent Updates — rewritten from the in-memory contention log
+ * - ## Audit Trail        — append-only update / message / override history
+ *
+ * Active State stays first and stays plain because it is the part people read.
+ * Replica State carries the stamps that make merge deterministic: without them
+ * a restart would re-stamp every key with a fresh clock and a peer holding
+ * older writes could beat state it had already lost to.
  */
 export class MarkdownLog {
   private staleConflictsCleared = false;
@@ -58,51 +66,79 @@ export class MarkdownLog {
       return;
     }
 
-    // Queue is memory-only — clear any stale Conflicts section once on boot.
+    // The contention log is memory-only — drop any stale section once on boot.
     if (!this.staleConflictsCleared) {
       this.staleConflictsCleared = true;
-      atomicWrite(this.filePath, rewriteConflictsSection(existing, []));
+      const parts = readParts(existing);
+      parts.contention = "";
+      atomicWrite(this.filePath, renderDoc(parts));
     }
   }
 
-  syncMarkdownLog(entry: AuditEntry, state?: ContextState): void {
+  syncMarkdownLog(
+    entry: AuditEntry,
+    state?: ContextState,
+    replica?: CrdtOp[],
+  ): void {
     this.ensureInitialized();
-    let content = readFileSync(this.filePath, "utf8");
-    if (state !== undefined) {
-      content = replaceActiveState(content, state);
-    }
-    content = appendAuditEntry(content, entry);
-    atomicWrite(this.filePath, content);
+    const parts = readParts(readFileSync(this.filePath, "utf8"));
+    if (state !== undefined) parts.active = jsonBlock(state);
+    if (replica !== undefined) parts.replica = replicaBlock(replica);
+    parts.audit = `${parts.audit}\n\n${renderAuditEntry(entry)}`.trim();
+    atomicWrite(this.filePath, renderDoc(parts));
   }
 
-  syncStatePatch(
+  /**
+   * Persist a state change.
+   *
+   * `replica` should be supplied whenever state moved — the plain view alone
+   * cannot be rehydrated without losing every stamp.
+   */
+  syncStateUpdate(
     source: Source,
-    ops: Operation[],
+    keys: string[],
     state: ContextState,
+    replica?: CrdtOp[],
     peer?: AuditPeer,
   ): void {
-    this.syncMarkdownLog({ source, peer, action: "State Patch", ops }, state);
+    this.syncMarkdownLog(
+      { source, peer, action: "State Update", keys },
+      state,
+      replica,
+    );
   }
 
   syncMessage(source: Source, text: string, peer?: AuditPeer): void {
     this.syncMarkdownLog({ source, peer, action: "Message", text });
   }
 
-  syncSnapshot(source: Source, state: ContextState, peer?: AuditPeer): void {
-    this.syncMarkdownLog({ source, peer, action: "State Snapshot" }, state);
+  syncSnapshot(
+    source: Source,
+    applied: number,
+    ignored: number,
+    peer?: AuditPeer,
+    state?: ContextState,
+    replica?: CrdtOp[],
+  ): void {
+    this.syncMarkdownLog(
+      { source, peer, action: "State Snapshot", applied, ignored },
+      state,
+      replica,
+    );
   }
 
-  /** Rewrite ## Conflicts from the live queue (omit section when empty). */
-  rewriteConflicts(items: ConflictItem[]): void {
+  /** Rewrite ## Concurrent Updates (omit the section when empty). */
+  rewriteContention(items: ContentionItem[]): void {
     this.ensureInitialized();
-    const content = readFileSync(this.filePath, "utf8");
-    atomicWrite(this.filePath, rewriteConflictsSection(content, items));
+    const parts = readParts(readFileSync(this.filePath, "utf8"));
+    parts.contention = formatContentionItems(items).trim();
+    atomicWrite(this.filePath, renderDoc(parts));
   }
 
   readActiveState(): ContextState {
     if (!existsSync(this.filePath)) return {};
     const content = readFileSync(this.filePath, "utf8");
-    const section = sliceActiveSection(content);
+    const section = sliceSection(content, ACTIVE_HEADING);
     if (section === undefined) return {};
 
     const start = section.indexOf("{");
@@ -120,6 +156,34 @@ export class MarkdownLog {
     return {};
   }
 
+  /**
+   * Stamped entries from the last run.
+   *
+   * Empty for a document written by the retired counter protocol; the caller
+   * falls back to `readActiveState` and re-stamps, which is safe because those
+   * documents carry no causal history to preserve.
+   */
+  readReplicaState(): CrdtOp[] {
+    if (!existsSync(this.filePath)) return [];
+    const content = readFileSync(this.filePath, "utf8");
+    const section = sliceSection(content, REPLICA_HEADING);
+    if (section === undefined) return [];
+
+    const start = section.indexOf("[");
+    const end = section.lastIndexOf("]");
+    if (start < 0 || end < start) return [];
+
+    try {
+      const parsed: unknown = JSON.parse(section.slice(start, end + 1));
+      if (Array.isArray(parsed)) return parsed as CrdtOp[];
+    } catch {
+      console.error(
+        "[markdown] failed to parse Replica State JSON; re-stamping from Active State",
+      );
+    }
+    return [];
+  }
+
   readLastLines(n = 50): string {
     if (!existsSync(this.filePath)) return "";
     return readFileTailLines(this.filePath, n);
@@ -131,31 +195,39 @@ export class MarkdownLog {
 }
 
 function buildSkeleton(state: ContextState): string {
-  return `${TITLE}\n\n${formatActiveSection(state)}\n${AUDIT_HEADING}\n\n`;
+  return renderDoc({
+    active: jsonBlock(state),
+    replica: replicaBlock([]),
+    contention: "",
+    audit: "",
+  });
 }
 
-function formatActiveSection(state: ContextState): string {
+function jsonBlock(value: unknown): string {
+  return "```json\n" + JSON.stringify(value, null, 2) + "\n```";
+}
+
+function replicaBlock(ops: CrdtOp[]): string {
   return (
-    `${ACTIVE_HEADING}\n` +
+    "<!-- CRDT stamps. Machine-managed; edit Active State instead. -->\n" +
     "```json\n" +
-    `${JSON.stringify(state, null, 2)}\n` +
-    "```\n"
+    JSON.stringify(ops) +
+    "\n```"
   );
 }
 
-function formatConflictsSection(items: ConflictItem[]): string {
+function formatContentionItems(items: ContentionItem[]): string {
   if (items.length === 0) return "";
-  let body = `${CONFLICTS_HEADING}\n\n`;
+  let body = "";
   for (const item of items) {
-    const peerLabel =
-      item.peerVersion === null ? "(missing)" : String(item.peerVersion);
+    const from =
+      item.peerFingerprint === null ? "a local write" : `peer ${safe(item.peerFingerprint)}`;
     body +=
-      `### [${formatTimestamp(new Date(item.detectedAt))}] - [ACTION: COLLISION DETECTED]\n` +
-      `A state merge conflict occurred.\n` +
-      `- **Conflict ID:** \`${item.id}\`\n` +
-      `- **Local Version:** ${item.localVersion}\n` +
-      `- **Peer Attempted Version:** ${peerLabel}\n` +
-      `Run the \`resolve_conflict\` tool to merge state.\n\n`;
+      `### [${formatTimestamp(new Date(item.detectedAt))}] - [ACTION: Concurrent Update]\n` +
+      `\`${safe(item.key)}\` was last written by node \`${safe(item.previousNode)}\` and was ` +
+      `overwritten by ${from}. Both replicas resolved this the same way, so no ` +
+      `action is required; use \`override_context\` to impose a different value.\n` +
+      `- **Entry ID:** \`${item.id}\`\n\n`;
   }
   return body;
 }
@@ -165,7 +237,7 @@ function formatMigratedBlock(oldBody: string): string {
   if (!trimmed) return "";
   const ts = formatTimestamp(new Date());
   return (
-    `### [${ts}] - [SOURCE: Local] - [ACTION: Migrated Phase 1 Log]\n\n` +
+    `### [${ts}] - [SOURCE: Local] - [ACTION: Migrated Log]\n\n` +
     trimmed
       .split("\n")
       .map((line) => `> ${line}`)
@@ -184,77 +256,65 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Next structural heading after Active State (Conflicts or Audit). */
-function nextSectionAfterActive(content: string, from: number): number {
-  const slice = content.slice(from);
-  const conflictsRel = findHeadingIndex(slice, CONFLICTS_HEADING);
-  const auditRel = findHeadingIndex(slice, AUDIT_HEADING);
-  const candidates = [conflictsRel, auditRel].filter((i) => i >= 0);
-  if (candidates.length === 0) return -1;
-  return from + Math.min(...candidates);
-}
+/** Every heading this document may contain, so bodies can be delimited. */
+const SECTION_HEADINGS = [
+  ACTIVE_HEADING,
+  REPLICA_HEADING,
+  CONFLICTS_HEADING,
+  AUDIT_HEADING,
+] as const;
 
-function sliceActiveSection(content: string): string | undefined {
-  const start = findHeadingIndex(content, ACTIVE_HEADING);
+/**
+ * Body of one section, delimited by whichever known heading comes next.
+ *
+ * Index arithmetic against a fixed section order broke as soon as a section was
+ * added; this only assumes the headings are distinct.
+ */
+function sliceSection(content: string, heading: string): string | undefined {
+  const start = findHeadingIndex(content, heading);
   if (start < 0) return undefined;
-  const afterHeading = start + ACTIVE_HEADING.length;
-  const bodyStart = content.indexOf("\n", afterHeading);
-  const from = bodyStart >= 0 ? bodyStart + 1 : afterHeading;
-  const end = nextSectionAfterActive(content, from);
-  if (end < 0) return content.slice(from);
-  return content.slice(from, end);
-}
 
-function replaceActiveState(content: string, state: ContextState): string {
-  const active = formatActiveSection(state);
-  const titleIdx = findHeadingIndex(content, TITLE);
-  const conflictsIdx = findHeadingIndex(content, CONFLICTS_HEADING);
-  const auditIdx = findHeadingIndex(content, AUDIT_HEADING);
+  const afterHeading = start + heading.length;
+  const newline = content.indexOf("\n", afterHeading);
+  const from = newline >= 0 ? newline + 1 : afterHeading;
 
-  const head =
-    titleIdx >= 0
-      ? content.slice(0, titleIdx) + `${TITLE}\n\n`
-      : `${TITLE}\n\n`;
-
-  // Preserve Conflicts (if any) + Audit Trail after Active State.
-  let rest: string;
-  if (conflictsIdx >= 0) {
-    rest = content.slice(conflictsIdx);
-  } else if (auditIdx >= 0) {
-    rest = content.slice(auditIdx);
-  } else {
-    rest = `${AUDIT_HEADING}\n\n`;
+  let end = -1;
+  for (const other of SECTION_HEADINGS) {
+    if (other === heading) continue;
+    const relative = findHeadingIndex(content.slice(from), other);
+    if (relative < 0) continue;
+    const absolute = from + relative;
+    if (end < 0 || absolute < end) end = absolute;
   }
-
-  return `${head}${active}\n${rest}`;
+  return end < 0 ? content.slice(from) : content.slice(from, end);
 }
 
-function rewriteConflictsSection(
-  content: string,
-  items: ConflictItem[],
-): string {
-  const activeIdx = findHeadingIndex(content, ACTIVE_HEADING);
-  const conflictsIdx = findHeadingIndex(content, CONFLICTS_HEADING);
-  const auditIdx = findHeadingIndex(content, AUDIT_HEADING);
+interface DocParts {
+  active: string;
+  replica: string;
+  contention: string;
+  audit: string;
+}
 
-  const before =
-    activeIdx >= 0
-      ? (() => {
-          const end = nextSectionAfterActive(
-            content,
-            activeIdx + ACTIVE_HEADING.length,
-          );
-          return end >= 0 ? content.slice(0, end) : content.slice(0, auditIdx >= 0 ? auditIdx : undefined);
-        })()
-      : `${TITLE}\n\n${formatActiveSection({})}\n`;
+function readParts(content: string): DocParts {
+  return {
+    active: sliceSection(content, ACTIVE_HEADING)?.trim() ?? jsonBlock({}),
+    replica: sliceSection(content, REPLICA_HEADING)?.trim() ?? replicaBlock([]),
+    contention: sliceSection(content, CONFLICTS_HEADING)?.trim() ?? "",
+    audit: sliceSection(content, AUDIT_HEADING)?.trim() ?? "",
+  };
+}
 
-  const audit =
-    auditIdx >= 0 ? content.slice(auditIdx) : `${AUDIT_HEADING}\n\n`;
-
-  const conflicts = formatConflictsSection(items);
-  // Drop any previous Conflicts block by rebuilding from Active + new Conflicts + Audit.
-  void conflictsIdx;
-  return `${before.trimEnd()}\n\n${conflicts}${audit}`.replace(/\n{3,}/g, "\n\n");
+function renderDoc(parts: DocParts): string {
+  let out = `${TITLE}\n\n`;
+  out += `${ACTIVE_HEADING}\n${parts.active}\n\n`;
+  out += `${REPLICA_HEADING}\n${parts.replica}\n\n`;
+  if (parts.contention.length > 0) {
+    out += `${CONFLICTS_HEADING}\n\n${parts.contention}\n\n`;
+  }
+  out += `${AUDIT_HEADING}\n\n`;
+  if (parts.audit.length > 0) out += `${parts.audit}\n`;
+  return out;
 }
 
 /**
@@ -267,54 +327,66 @@ function rewriteConflictsSection(
 function formatSource(entry: AuditEntry): string {
   if (entry.source !== "Peer" || !entry.peer) return entry.source;
   const { fingerprint, label } = entry.peer;
-  const suffix = label ? ` (${label})` : "";
-  return `Peer ${fingerprint}${suffix}`;
+  const suffix = label ? ` (${safe(label)})` : "";
+  return `Peer ${safe(fingerprint)}${suffix}`;
 }
 
-function appendAuditEntry(content: string, entry: AuditEntry): string {
+/**
+ * Anything peer-controlled that lands in the audit trail goes through here.
+ *
+ * Keys, refusal reasons and node ids all originate on the wire. Interpolated
+ * raw they can open a second `###` heading — forging an entry attributed to
+ * Local — or inject a `##` section heading, which the section parser then reads
+ * as a boundary and silently truncates history at.
+ */
+function safe(value: string): string {
+  return sanitizeLabel(value);
+}
+
+function renderAuditEntry(entry: AuditEntry): string {
   const ts = formatTimestamp(new Date());
-  let block: string;
+  const head = `### [${ts}] - [SOURCE: ${formatSource(entry)}]`;
 
-  if (entry.action === "State Patch") {
-    block =
-      `### [${ts}] - [SOURCE: ${formatSource(entry)}] - [ACTION: State Patch]\n` +
-      "```json\n" +
-      `${JSON.stringify(entry.ops, null, 2)}\n` +
-      "```\n\n";
-  } else if (entry.action === "State Snapshot") {
-    block =
-      `### [${ts}] - [SOURCE: ${formatSource(entry)}] - [ACTION: State Snapshot]\n` +
-      "- **Content:** Full Active State replaced from peer handshake.\n\n";
-  } else if (entry.action === "Collision Detected") {
-    const peerLabel =
-      entry.peerVersion === null ? "(missing)" : String(entry.peerVersion);
-    block =
-      `### [${ts}] - [SOURCE: ${formatSource(entry)}] - [ACTION: COLLISION DETECTED]\n` +
-      `A state merge conflict occurred.\n` +
-      `- **Conflict ID:** \`${entry.conflictId}\`\n` +
-      `- **Local Version:** ${entry.localVersion}\n` +
-      `- **Peer Attempted Version:** ${peerLabel}\n` +
-      `Run the \`resolve_conflict\` tool to merge state.\n\n`;
-  } else if (entry.action === "Conflict Resolution") {
-    block =
-      `### [${ts}] - [SOURCE: ${formatSource(entry)}] - [ACTION: Conflict Resolution]\n` +
-      `- **Strategy:** \`${entry.strategy}\`\n` +
-      `- **Conflict ID:** \`${entry.conflictId}\`\n` +
-      `- **Detail:** ${entry.detail}\n\n`;
-  } else {
-    block =
-      `### [${ts}] - [SOURCE: ${formatSource(entry)}] - [ACTION: Message]\n` +
-      "- **Content:**\n";
-    for (const line of entry.text.split("\n")) {
-      block += `> ${line}\n`;
-    }
-    block += "\n";
+  if (entry.action === "State Update") {
+    return (
+      `${head} - [ACTION: State Update]\n` +
+      `- **Keys:** ${entry.keys.map((k) => `\`${safe(k)}\``).join(", ")}\n`
+    );
+  }
+  if (entry.action === "State Snapshot") {
+    return (
+      `${head} - [ACTION: State Snapshot]\n` +
+      `- **Merged:** ${entry.applied} key(s) applied, ${entry.ignored} already current.\n`
+    );
+  }
+  if (entry.action === "Concurrent Update") {
+    return (
+      `${head} - [ACTION: Concurrent Update]\n` +
+      `- **Key:** \`${safe(entry.key)}\`\n` +
+      `- **Previously written by:** \`${safe(entry.previousNode)}\`\n` +
+      `- **Resolution:** settled by stamp order; identical on every replica.\n`
+    );
+  }
+  if (entry.action === "Override") {
+    return (
+      `${head} - [ACTION: Override]\n` +
+      `- **Keys:** ${entry.keys.map((k) => `\`${safe(k)}\``).join(", ")}\n` +
+      `- **Detail:** ${safe(entry.detail)}\n`
+    );
+  }
+  if (entry.action === "Rejected Update") {
+    return (
+      `${head} - [ACTION: Rejected Update]\n` +
+      `- **Reason:** ${safe(entry.reason)}\n` +
+      `- **Keys:** ${entry.keys.map((k) => `\`${safe(k)}\``).join(", ") || "(none)"}\n`
+    );
   }
 
-  if (findHeadingIndex(content, AUDIT_HEADING) < 0) {
-    return `${content.trimEnd()}\n\n${AUDIT_HEADING}\n\n${block}`;
+  let block = `${head} - [ACTION: Message]\n- **Content:**\n`;
+  for (const line of entry.text.split(/\r\n|\r|\n|\u2028|\u2029/)) {
+    block += `> ${line}\n`;
   }
-  return content.trimEnd() + "\n\n" + block;
+  return block;
 }
 
 function formatTimestamp(date: Date): string {
