@@ -5,6 +5,7 @@ import type { MarkdownLog } from "./markdown-log.js";
 import type { P2PNode } from "./p2p.js";
 import type { ConflictQueue } from "./conflicts.js";
 import type {
+  AuditPeer,
   ContextState,
   MergeStrategy,
   Source,
@@ -99,6 +100,7 @@ export function applyStatePatch(
   ops: Operation[],
   source: Source,
   broadcast: boolean,
+  peer?: AuditPeer,
 ): ApplyPatchResult {
   const parsed = JsonPatchArraySchema.safeParse(ops);
   if (!parsed.success) {
@@ -121,7 +123,7 @@ export function applyStatePatch(
     return { ok: false, error: `applyPatch failed: ${message}` };
   }
 
-  services.log.syncStatePatch(source, validated, services.store.snapshot());
+  services.log.syncStatePatch(source, validated, services.store.snapshot(), peer);
 
   if (broadcast && services.p2p) {
     services.p2p.broadcast({ type: "patch", ops: validated });
@@ -136,6 +138,7 @@ export function applyStatePatch(
 export function handleInboundPatch(
   services: SyncServices,
   ops: Operation[],
+  peer?: AuditPeer,
 ): InboundPatchResult {
   const parsed = JsonPatchArraySchema.safeParse(ops);
   if (!parsed.success) {
@@ -184,6 +187,7 @@ export function handleInboundPatch(
     services.conflicts.syncMarkdown(services.log);
     services.log.syncMarkdownLog({
       source: "Peer",
+      peer,
       action: "Collision Detected",
       localVersion,
       peerVersion,
@@ -199,7 +203,7 @@ export function handleInboundPatch(
   }
 
   const beforeApply = services.store.snapshot();
-  const applied = applyStatePatch(services, validated, "Peer", false);
+  const applied = applyStatePatch(services, validated, "Peer", false, peer);
   if (!applied.ok) {
     return { status: "rejected", error: applied.error };
   }
@@ -339,6 +343,7 @@ export function applyPeerSnapshot(
   services: SyncServices,
   state: ContextState,
   source: Source,
+  peer?: AuditPeer,
 ): ApplySnapshotResult {
   const parsed = PeerEnvelopeSchema.safeParse({ type: "snapshot", state });
   if (!parsed.success || parsed.data.type !== "snapshot") {
@@ -376,7 +381,7 @@ export function applyPeerSnapshot(
   }
 
   services.store.replaceAll(clean);
-  services.log.syncSnapshot(source, services.store.snapshot());
+  services.log.syncSnapshot(source, services.store.snapshot(), peer);
   return { ok: true, state: services.store.snapshot() };
 }
 
@@ -388,8 +393,9 @@ export function recordMessage(
   text: string,
   source: Source,
   broadcast: boolean,
+  peer?: AuditPeer,
 ): void {
-  services.log.syncMessage(source, text);
+  services.log.syncMessage(source, text, peer);
   if (broadcast && services.p2p) {
     services.p2p.broadcast({ type: "message", text });
   }

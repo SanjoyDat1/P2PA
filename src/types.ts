@@ -2,6 +2,18 @@ import { z } from "zod";
 import type { Operation } from "fast-json-patch";
 
 export type Source = "Local" | "Peer";
+
+/**
+ * Attribution for a `Peer`-sourced audit entry.
+ *
+ * The fingerprint is derived from the Noise-authenticated remote public key, so
+ * it identifies *which* peer acted — `SOURCE: Peer` alone cannot. The label is
+ * peer-supplied and sanitized; treat the fingerprint as the identity.
+ */
+export interface AuditPeer {
+  fingerprint: string;
+  label: string | null;
+}
 export type AuditAction =
   | "State Patch"
   | "State Snapshot"
@@ -28,6 +40,7 @@ export interface ConflictItem {
 
 export interface ConflictResolutionAudit {
   source: Source;
+  peer?: AuditPeer;
   action: "Conflict Resolution";
   strategy: MergeStrategy;
   conflictId: string;
@@ -36,6 +49,7 @@ export interface ConflictResolutionAudit {
 
 export interface CollisionDetectedAudit {
   source: Source;
+  peer?: AuditPeer;
   action: "Collision Detected";
   localVersion: number;
   peerVersion: number | null;
@@ -80,17 +94,20 @@ export interface CliOptions {
 
 export interface StatePatchAudit {
   source: Source;
+  peer?: AuditPeer;
   action: "State Patch";
   ops: Operation[];
 }
 
 export interface StateSnapshotAudit {
   source: Source;
+  peer?: AuditPeer;
   action: "State Snapshot";
 }
 
 export interface MessageAudit {
   source: Source;
+  peer?: AuditPeer;
   action: "Message";
   text: string;
 }

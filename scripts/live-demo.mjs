@@ -4,7 +4,7 @@
  */
 import { ContextStore } from "../dist/store.js";
 import { MarkdownLog } from "../dist/markdown-log.js";
-import { P2PNode } from "../dist/p2p.js";
+import { P2PNode, describePeer } from "../dist/p2p.js";
 import { ConflictQueue } from "../dist/conflicts.js";
 import {
   commitLocalMutation,
@@ -25,15 +25,16 @@ const pathA = join(dirA, "shared_context.md");
 const pathB = join(dirB, "shared_context.md");
 
 function handle(store, log, conflicts) {
-  return (envelope, remote) => {
+  return (envelope, peer) => {
+    const audit = { fingerprint: peer.fingerprint, label: peer.label };
     if (envelope.type === "snapshot") {
-      applyPeerSnapshot({ store, log, conflicts }, envelope.state, "Peer");
+      applyPeerSnapshot({ store, log, conflicts }, envelope.state, "Peer", audit);
     } else if (envelope.type === "patch") {
-      handleInboundPatch({ store, log, conflicts }, envelope.ops);
+      handleInboundPatch({ store, log, conflicts }, envelope.ops, audit);
     } else {
-      recordMessage({ store, log, conflicts }, envelope.text, "Peer", false);
+      recordMessage({ store, log, conflicts }, envelope.text, "Peer", false, audit);
     }
-    console.error(`[demo] received ${envelope.type} from ${remote}`);
+    console.error(`[demo] received ${envelope.type} from ${describePeer(peer)}`);
   };
 }
 
@@ -46,13 +47,18 @@ const conflictsB = new ConflictQueue();
 logA.ensureInitialized();
 logB.ensureInitialized();
 
+// Both peers live in this process, so there is nobody to allowlist — `open`
+// keeps the demo about sync. Real deployments default to `strict`; see
+// `p2pa pair` and the Peer authentication section of the README.
 const a = new P2PNode({
   topic,
+  authMode: "open",
   getActiveState: () => storeA.snapshot(),
   onPeerMessage: handle(storeA, logA, conflictsA),
 });
 const b = new P2PNode({
   topic,
+  authMode: "open",
   getActiveState: () => storeB.snapshot(),
   onPeerMessage: handle(storeB, logB, conflictsB),
 });

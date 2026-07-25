@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import type { Operation } from "fast-json-patch";
 import type {
   AuditEntry,
+  AuditPeer,
   ConflictItem,
   ContextState,
   Source,
@@ -74,16 +75,21 @@ export class MarkdownLog {
     atomicWrite(this.filePath, content);
   }
 
-  syncStatePatch(source: Source, ops: Operation[], state: ContextState): void {
-    this.syncMarkdownLog({ source, action: "State Patch", ops }, state);
+  syncStatePatch(
+    source: Source,
+    ops: Operation[],
+    state: ContextState,
+    peer?: AuditPeer,
+  ): void {
+    this.syncMarkdownLog({ source, peer, action: "State Patch", ops }, state);
   }
 
-  syncMessage(source: Source, text: string): void {
-    this.syncMarkdownLog({ source, action: "Message", text });
+  syncMessage(source: Source, text: string, peer?: AuditPeer): void {
+    this.syncMarkdownLog({ source, peer, action: "Message", text });
   }
 
-  syncSnapshot(source: Source, state: ContextState): void {
-    this.syncMarkdownLog({ source, action: "State Snapshot" }, state);
+  syncSnapshot(source: Source, state: ContextState, peer?: AuditPeer): void {
+    this.syncMarkdownLog({ source, peer, action: "State Snapshot" }, state);
   }
 
   /** Rewrite ## Conflicts from the live queue (omit section when empty). */
@@ -251,25 +257,39 @@ function rewriteConflictsSection(
   return `${before.trimEnd()}\n\n${conflicts}${audit}`.replace(/\n{3,}/g, "\n\n");
 }
 
+/**
+ * Render the SOURCE field, including which peer acted when known:
+ *   `Local` · `Peer` · `Peer a3f9c1b2` · `Peer a3f9c1b2 (sanjoy-laptop)`
+ *
+ * Labels are sanitized upstream (`peer-key.ts`), so they cannot inject Markdown
+ * structure or line breaks into the audit trail.
+ */
+function formatSource(entry: AuditEntry): string {
+  if (entry.source !== "Peer" || !entry.peer) return entry.source;
+  const { fingerprint, label } = entry.peer;
+  const suffix = label ? ` (${label})` : "";
+  return `Peer ${fingerprint}${suffix}`;
+}
+
 function appendAuditEntry(content: string, entry: AuditEntry): string {
   const ts = formatTimestamp(new Date());
   let block: string;
 
   if (entry.action === "State Patch") {
     block =
-      `### [${ts}] - [SOURCE: ${entry.source}] - [ACTION: State Patch]\n` +
+      `### [${ts}] - [SOURCE: ${formatSource(entry)}] - [ACTION: State Patch]\n` +
       "```json\n" +
       `${JSON.stringify(entry.ops, null, 2)}\n` +
       "```\n\n";
   } else if (entry.action === "State Snapshot") {
     block =
-      `### [${ts}] - [SOURCE: ${entry.source}] - [ACTION: State Snapshot]\n` +
+      `### [${ts}] - [SOURCE: ${formatSource(entry)}] - [ACTION: State Snapshot]\n` +
       "- **Content:** Full Active State replaced from peer handshake.\n\n";
   } else if (entry.action === "Collision Detected") {
     const peerLabel =
       entry.peerVersion === null ? "(missing)" : String(entry.peerVersion);
     block =
-      `### [${ts}] - [SOURCE: ${entry.source}] - [ACTION: COLLISION DETECTED]\n` +
+      `### [${ts}] - [SOURCE: ${formatSource(entry)}] - [ACTION: COLLISION DETECTED]\n` +
       `A state merge conflict occurred.\n` +
       `- **Conflict ID:** \`${entry.conflictId}\`\n` +
       `- **Local Version:** ${entry.localVersion}\n` +
@@ -277,13 +297,13 @@ function appendAuditEntry(content: string, entry: AuditEntry): string {
       `Run the \`resolve_conflict\` tool to merge state.\n\n`;
   } else if (entry.action === "Conflict Resolution") {
     block =
-      `### [${ts}] - [SOURCE: ${entry.source}] - [ACTION: Conflict Resolution]\n` +
+      `### [${ts}] - [SOURCE: ${formatSource(entry)}] - [ACTION: Conflict Resolution]\n` +
       `- **Strategy:** \`${entry.strategy}\`\n` +
       `- **Conflict ID:** \`${entry.conflictId}\`\n` +
       `- **Detail:** ${entry.detail}\n\n`;
   } else {
     block =
-      `### [${ts}] - [SOURCE: ${entry.source}] - [ACTION: Message]\n` +
+      `### [${ts}] - [SOURCE: ${formatSource(entry)}] - [ACTION: Message]\n` +
       "- **Content:**\n";
     for (const line of entry.text.split("\n")) {
       block += `> ${line}\n`;

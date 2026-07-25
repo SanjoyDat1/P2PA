@@ -9,6 +9,9 @@
  *   log              Tail ~/.p2pa/shared_context.md
  *   connect          Print MCP JSON config for Cursor / Claude Desktop
  *   mcp              Run foreground MCP+P2P server (stdio — for agents)
+ *   pair [token]     Print your invite token, or accept a peer's
+ *   peers            List allowlisted peers (peers remove <x> to revoke)
+ *   auth <mode>      Set connection policy: strict | open
  *   doc create|link|unlink|status  Google Docs living-doc bridge
  */
 import { createHash } from "node:crypto";
@@ -21,6 +24,7 @@ import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import {
   DAEMON_NAME,
+  addPeer,
   clearDocLink,
   ensureConfigDir,
   ensureTopic,
@@ -28,9 +32,18 @@ import {
   getDaemonErrorLogPath,
   getDaemonOutLogPath,
   getSharedContextPath,
+  listPeers,
   readConfig,
+  removePeer,
+  resolveAuthMode,
+  setAuthMode,
   setDocLink,
+  writeTopicPreservingRest,
+  type AuthMode,
 } from "./config.js";
+import { loadOrCreateIdentity, setIdentityLabel } from "./identity.js";
+import { decodeInvite, encodeInvite } from "./invite.js";
+import { shortFingerprint } from "./peer-key.js";
 import {
   createGoogleDocsClientFromEnv,
   documentUrl,
@@ -220,15 +233,18 @@ async function cmdStatus(): Promise<void> {
     statusLine = `error (${message})`;
   }
 
-  const topicFingerprint = config?.topic
-    ? createHash("sha256").update(config.topic).digest("hex").slice(0, 8)
-    : null;
+  const topicFingerprint = config?.topic ? topicFingerprintOf(config.topic) : null;
+  const { mode, legacy } = resolveAuthMode(config);
+  const peers = listPeers();
+  const identity = loadOrCreateIdentity();
 
   process.stdout.write(
     `p2pa status\n` +
       `  daemon:  ${statusLine}\n` +
       details +
+      `  you:     ${identity.fingerprint} (${identity.label})\n` +
       `  topic:   ${topicFingerprint ? `fingerprint ${topicFingerprint}` : "(none — run p2pa start)"}\n` +
+      formatAuthBanner(mode, legacy, peers.length) +
       `  config:  ${getConfigDir()}\n` +
       `  context: ${getSharedContextPath()}\n` +
       `  errors:  ${getDaemonErrorLogPath()}\n`,
@@ -430,6 +446,180 @@ function cmdDocStatus(): void {
   );
 }
 
+function formatAuthBanner(mode: AuthMode, legacy: boolean, peerCount: number): string {
+  if (mode === "strict") {
+    return peerCount === 0
+      ? `  auth:    strict (0 peers allowlisted — nobody can connect yet)\n`
+      : `  auth:    strict (${peerCount} peer(s) allowlisted)\n`;
+  }
+  return (
+    `  auth:    OPEN${legacy ? " (legacy config)" : ""} — anyone with the topic can read/write\n` +
+    `           run \`p2pa auth strict\` after pairing your peers\n`
+  );
+}
+
+/** `p2pa pair` — print an invite token for this node. */
+function cmdPairShow(label?: string): void {
+  ensureConfigDir();
+  const { topic } = ensureTopic();
+  const identity =
+    label && label.trim().length > 0
+      ? setIdentityLabel(label)
+      : loadOrCreateIdentity();
+
+  const token = encodeInvite({
+    topic,
+    pubkey: identity.publicKeyHex,
+    label: identity.label,
+  });
+
+  process.stdout.write(
+    `Your P2PA invite token\n` +
+      `  identity: ${identity.fingerprint} (${identity.label})\n` +
+      `  pubkey:   ${identity.publicKeyHex}\n` +
+      `\n` +
+      `${token}\n` +
+      `\n` +
+      `Send it to your peer over a channel you trust — it contains the pairing\n` +
+      `topic, so treat it like a password.\n` +
+      `\n` +
+      `Pairing is mutual. Both sides must run:\n` +
+      `  p2pa pair <their-token>\n` +
+      `\n` +
+      `Then restart \`p2pa mcp\` / \`p2pa start\` on a fresh install, or just keep\n` +
+      `going — a running node picks up allowlist changes automatically.\n`,
+  );
+}
+
+/** `p2pa pair <token>` — allowlist the issuer and adopt their topic. */
+function cmdPairAccept(token: string, adoptTopic: boolean): void {
+  ensureConfigDir();
+  const parsed = decodeInvite(token);
+  if (!parsed.ok) {
+    throw new Error(`Invalid invite token: ${parsed.error}`);
+  }
+  const { invite } = parsed;
+
+  const identity = loadOrCreateIdentity();
+  if (invite.pubkey === identity.publicKeyHex) {
+    throw new Error(
+      "That is your own invite token — send it to your peer and paste theirs instead.",
+    );
+  }
+
+  const existing = readConfig();
+  const topicDiffers = existing !== null && existing.topic !== invite.topic;
+  if (topicDiffers && !adoptTopic) {
+    throw new Error(
+      `This token is for a different pairing topic than the one you are on ` +
+        `(local fingerprint ${topicFingerprintOf(existing.topic)}, token ${topicFingerprintOf(invite.topic)}).\n` +
+        `Switching topics leaves your current peers behind. Re-run with --adopt-topic ` +
+        `if that is what you want.`,
+    );
+  }
+
+  if (existing === null || topicDiffers) {
+    writeTopicPreservingRest(invite.topic);
+  }
+
+  const result = addPeer(invite.pubkey, invite.label);
+  if (!result.ok) {
+    throw new Error(`Could not allowlist peer: ${result.error}`);
+  }
+
+  const { mode, legacy } = resolveAuthMode(readConfig());
+  const myToken = encodeInvite({
+    topic: invite.topic,
+    pubkey: identity.publicKeyHex,
+    label: identity.label,
+  });
+
+  process.stdout.write(
+    `${result.updated ? "✓ Updated" : "✓ Allowlisted"} peer\n` +
+      `  ${shortFingerprint(invite.pubkey)} (${invite.label})\n` +
+      `  ${invite.pubkey}\n` +
+      (topicDiffers ? `  adopted pairing topic ${topicFingerprintOf(invite.topic)}\n` : "") +
+      `\n` +
+      formatAuthBanner(mode, legacy, listPeers().length) +
+      `\n` +
+      `Now send YOUR token back so they can allowlist you:\n` +
+      `\n` +
+      `${myToken}\n` +
+      (mode === "open"
+        ? `\nOnce both sides have paired, lock the swarm down:\n  p2pa auth strict\n`
+        : ""),
+  );
+}
+
+function topicFingerprintOf(topic: string): string {
+  return createHash("sha256").update(topic).digest("hex").slice(0, 8);
+}
+
+function cmdPeersList(): void {
+  const peers = listPeers();
+  const { mode, legacy } = resolveAuthMode(readConfig());
+  const identity = loadOrCreateIdentity();
+
+  let out =
+    `p2pa peers\n` +
+    `  you:     ${identity.fingerprint} (${identity.label})\n` +
+    formatAuthBanner(mode, legacy, peers.length) +
+    `\n`;
+
+  if (peers.length === 0) {
+    out += `  (no peers allowlisted — run \`p2pa pair\` to get started)\n`;
+    process.stdout.write(out);
+    return;
+  }
+
+  for (const peer of peers) {
+    out +=
+      `  ${shortFingerprint(peer.pubkey)}  ${peer.label}\n` +
+      `            ${peer.pubkey}\n` +
+      `            added ${peer.addedAt}\n`;
+  }
+  process.stdout.write(out);
+}
+
+function cmdPeersRemove(target: string): void {
+  const removed = removePeer(target);
+  if (!removed) {
+    throw new Error(
+      `No allowlisted peer matches "${target}" (use the full public key or the exact label).`,
+    );
+  }
+  process.stdout.write(
+    `✓ Removed peer ${shortFingerprint(removed.pubkey)} (${removed.label})\n` +
+      `  Running nodes drop the connection automatically.\n`,
+  );
+}
+
+function cmdAuth(mode: AuthMode): void {
+  const config = readConfig();
+  if (!config) {
+    throw new Error(
+      "No pairing topic yet — run `p2pa start --topic …` or `p2pa mcp` once first.",
+    );
+  }
+
+  const peers = listPeers();
+  if (mode === "strict" && peers.length === 0) {
+    process.stdout.write(
+      `Warning: the allowlist is empty, so strict mode blocks every peer.\n` +
+        `Run \`p2pa pair\` first if you expect to connect to someone.\n\n`,
+    );
+  }
+
+  setAuthMode(mode);
+  process.stdout.write(
+    mode === "strict"
+      ? `✓ auth mode: strict — only the ${peers.length} allowlisted peer(s) may connect\n` +
+          `  Running nodes apply this on their next restart.\n`
+      : `✓ auth mode: open — anyone who knows your topic may read and write your\n` +
+          `  shared context. This is not recommended; prefer \`p2pa auth strict\`.\n`,
+  );
+}
+
 async function main(): Promise<void> {
   await yargs(hideBin(process.argv))
     .scriptName("p2pa")
@@ -466,6 +656,72 @@ async function main(): Promise<void> {
       () => {},
       () => {
         cmdConnect();
+      },
+    )
+    .command(
+      "pair [token]",
+      "Print your invite token, or accept a peer's token to allowlist them",
+      (y) =>
+        y
+          .positional("token", {
+            type: "string",
+            describe: "A peer's invite token (omit to print your own)",
+          })
+          .option("label", {
+            type: "string",
+            describe: "Rename this node before printing your token",
+          })
+          .option("adopt-topic", {
+            type: "boolean",
+            default: false,
+            describe:
+              "Accept a token whose pairing topic differs from your current one",
+          }),
+      (argv) => {
+        const token = argv.token;
+        if (token !== undefined && token.trim().length > 0) {
+          cmdPairAccept(token, argv["adoptTopic"] === true);
+          return;
+        }
+        cmdPairShow(argv.label);
+      },
+    )
+    .command(
+      "peers",
+      "List allowlisted peers (peers remove <pubkey|label> to revoke)",
+      (y) =>
+        y.command(
+          "remove <peer>",
+          "Revoke a peer by public key or exact label",
+          (yy) =>
+            yy.positional("peer", {
+              type: "string",
+              describe: "Full public key or exact label",
+              demandOption: true,
+            }),
+          (argv) => {
+            cmdPeersRemove(String(argv.peer));
+          },
+        ),
+      (argv) => {
+        // Parent handler runs only when no subcommand matched.
+        if ((argv._ as (string | number)[]).length <= 1) {
+          cmdPeersList();
+        }
+      },
+    )
+    .command(
+      "auth <mode>",
+      "Set the connection policy: strict (allowlist only) or open",
+      (y) =>
+        y.positional("mode", {
+          type: "string",
+          choices: ["strict", "open"] as const,
+          describe: "strict = allowlisted peers only; open = anyone with the topic",
+          demandOption: true,
+        }),
+      (argv) => {
+        cmdAuth(String(argv.mode) as AuthMode);
       },
     )
     .command(
@@ -531,7 +787,7 @@ async function main(): Promise<void> {
     )
     .demandCommand(
       1,
-      "Specify a command: start | stop | status | log | connect | mcp | doc",
+      "Specify a command: start | stop | status | log | connect | mcp | pair | peers | auth | doc",
     )
     .strict()
     .help()
