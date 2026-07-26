@@ -77,6 +77,8 @@ export interface P2POptions {
   /** Called to obtain the stamped replica state for handshake snapshots. */
   getActiveState: () => CrdtOp[];
   onPeerMessage: PeerMessageHandler;
+  /** Called once a peer is authenticated and connected, for outbox replay. */
+  onPeerConnect?: (peer: PeerIdentity) => void;
 }
 
 interface ConnState {
@@ -100,6 +102,7 @@ export class P2PNode {
   private readonly topicFingerprint: string;
   private readonly getActiveState: () => CrdtOp[];
   private readonly onPeerMessage: PeerMessageHandler;
+  private readonly onPeerConnect: (peer: PeerIdentity) => void;
   private readonly connState = new WeakMap<Duplex, ConnState>();
   private readonly authMode: AuthMode;
   private readonly isPeerAllowed: (pubkeyHex: string) => boolean;
@@ -117,6 +120,7 @@ export class P2PNode {
       .slice(0, 8);
     this.getActiveState = options.getActiveState;
     this.onPeerMessage = options.onPeerMessage;
+    this.onPeerConnect = options.onPeerConnect ?? (() => {});
     this.authMode = options.authMode;
     // Fail closed: strict mode with no allowlist admits nobody, not everybody.
     this.isPeerAllowed = options.isPeerAllowed ?? (() => false);
@@ -215,6 +219,34 @@ export class P2PNode {
     }
   }
 
+  /**
+   * Send to one peer, if it is connected. Returns false when it is not.
+   *
+   * Used to replay a backlog to the peer that just arrived, rather than
+   * broadcasting it at everyone who was already up to date.
+   */
+  sendTo(publicKeyHex: string, envelope: PeerEnvelope): boolean {
+    const line = encodeNdjsonLine(envelope);
+    for (const conn of this.swarm.connections) {
+      const peer = this.identifyPeer(conn);
+      if (peer.pubkey === publicKeyHex) {
+        writeLine(conn, line);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Public keys of every currently connected peer. */
+  connectedKeys(): string[] {
+    const keys: string[] = [];
+    for (const conn of this.swarm.connections) {
+      const peer = this.identifyPeer(conn);
+      if (peer.pubkey !== null) keys.push(peer.pubkey);
+    }
+    return keys;
+  }
+
   /** Number of currently open peer connections. */
   connectionCount(): number {
     return this.swarm.connections.size;
@@ -307,6 +339,15 @@ export class P2PNode {
       this.connState.delete(conn);
       console.error(`[p2p] Peer disconnected (${remoteLabel})`);
     });
+
+    // Last: after the snapshot so the peer already has current state, and after
+    // the error handler because a replay can push a batch of messages.
+    try {
+      this.onPeerConnect(peer);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[p2p] connect handler failed for ${remoteLabel}: ${message}`);
+    }
   }
 
   private onData(

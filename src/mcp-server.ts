@@ -10,8 +10,8 @@ import {
   claimTask,
   commitLocalMutation,
   overrideKeys,
-  recordMessage,
   releaseTask,
+  sendMessage,
 } from "./sync.js";
 import {
   DEFAULT_CLAIM_TTL_MS,
@@ -19,6 +19,7 @@ import {
   MIN_CLAIM_TTL_MS,
 } from "./claim.js";
 import { DEFAULT_WAIT_MS, MAX_WAIT_MS, type EventBus } from "./events.js";
+import type { Outbox } from "./outbox.js";
 import {
   MAX_KEY_LENGTH,
   MAX_PAYLOAD_BYTES,
@@ -34,6 +35,12 @@ export interface AppServices {
   p2p: P2PNode;
   contention: ContentionLog;
   events: EventBus;
+  outbox: Outbox;
+  /**
+   * Peers a message is addressed to — everyone paired, not merely everyone
+   * currently connected. Being offline is the case the outbox exists for.
+   */
+  recipients: () => string[];
   /** Optional Google Docs living-doc bridge. */
   doc?: DocBridge;
 }
@@ -504,6 +511,33 @@ export function createMcpServer(services: AppServices): McpServer {
   );
 
   server.registerTool(
+    "outbox_status",
+    {
+      description:
+        "Messages waiting for a peer to confirm receipt. Anything listed here " +
+        "has been sent or queued and will be retried automatically on reconnect.",
+      inputSchema: {},
+    },
+    async () => {
+      const status = services.outbox.status();
+      return textResult(
+        JSON.stringify(
+          {
+            ...status,
+            connectedPeers: services.p2p.connectionCount(),
+            note:
+              status.pending === 0
+                ? "Nothing awaiting delivery."
+                : "Undelivered messages are replayed when the peer reconnects.",
+          },
+          null,
+          2,
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
     "sync_health",
     {
       description:
@@ -523,6 +557,7 @@ export function createMcpServer(services: AppServices): McpServer {
             concurrentUpdates: services.contention.size,
             claimsHash: services.store.claimsHash(),
             latestEventSeq: services.events.latestSeq,
+            outboxPending: services.outbox.status().pending,
             claimsHeldHere: services.store
               .listClaims()
               .filter((view) => view.held && view.holder === services.store.nodeId)
@@ -586,7 +621,9 @@ export function createMcpServer(services: AppServices): McpServer {
     "send_peer_message",
     {
       description:
-        "Append a peer message to the Markdown Audit Trail and send it as a direct message event to the connected peer.",
+        "Send a message to your peers. Queued first, so a peer who is offline " +
+        "or restarting still receives it when they return — you do not need to " +
+        "resend. Use outbox_status to see anything still awaiting confirmation.",
       inputSchema: {
         message: z
           .string()
@@ -596,19 +633,22 @@ export function createMcpServer(services: AppServices): McpServer {
       },
     },
     async ({ message }) => {
-      recordMessage(services, message, "Local", true);
+      const delivery = sendMessage(services, message, services.recipients());
       console.error(
-        `[mcp] send_peer_message peers=${services.p2p.connectionCount()}`,
+        `[mcp] send_peer_message delivered=${delivery.deliveredNow} queued=${delivery.queued}`,
       );
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Sent peer message (${message.length} chars) to ${services.p2p.connectionCount()} peer(s).`,
-          },
-        ],
-      };
+      if (delivery.deliveredNow > 0) {
+        return textResult(
+          `Delivered to ${delivery.deliveredNow} peer(s). Kept in the outbox ` +
+            `until they confirm receipt.`,
+        );
+      }
+      return textResult(
+        "No peers are connected right now, so this is queued. It will be " +
+          "delivered automatically the next time they come online — you do not " +
+          "need to resend it.",
+      );
     },
   );
 

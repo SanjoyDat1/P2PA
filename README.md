@@ -29,6 +29,7 @@ Multi-agent collaboration is still broken in three ways:
 - **Add-wins sets** — Concurrent appends to a list all survive, instead of one agent's entries overwriting the other's.
 - **Work-claiming leases** — An agent claims a task before starting it, so two agents never do the same job. Leases expire on their own, so a crashed agent cannot block the backlog.
 - **Event-driven, not polling** — An agent can block until the other one actually does something, instead of hoping it remembers to check.
+- **Messages survive a disconnect** — Write to a peer whose agent is offline and it is delivered when they return. Nobody has to resend.
 - **Human-readable audit log** — Every change lands in `~/.p2pa/shared_context.md`, attributed to the peer that made it.
 
 ---
@@ -273,6 +274,8 @@ Once connected, agents can call:
 | `claim_task` | Take a lease on a task so a peer does not start the same work |
 | `release_task` | Hand a task back before its lease expires |
 | `list_claims` | See which tasks are in flight and who holds them |
+| `send_peer_message` | Message your peers; queued and retried if they are offline |
+| `outbox_status` | Messages still awaiting confirmation |
 | `await_peer_event` | Block until a peer acts, then return what they did |
 | `recent_peer_events` | Catch up on peer activity without blocking |
 | `sync_health` | Replica id, content hash, peer count — equal hashes mean equal state |
@@ -314,6 +317,35 @@ Two honest limitations:
   peer can bid a higher generation and take a live lease, just as it can
   overwrite any state key. Displaced leases surface in `check_conflicts` and the
   audit trail. Pair with peers you trust.
+
+### Leaving word for an offline peer
+
+Messages used to go straight to whatever sockets were open, so anything written
+while the other agent was asleep, restarting, or on a train was simply lost.
+
+A message is now queued first and sent second:
+
+```
+Agent A: send_peer_message("auth refactor is done")   → nobody online, queued
+                    … Agent B starts up …
+Agent B: ← receives it automatically on connect
+```
+
+- **Queued before sending**, so a socket that drops mid-flight loses nothing.
+- **Retried until confirmed.** A message is only dropped once the recipient
+  acknowledges it, so "written to the socket" is never mistaken for "received".
+- **Delivered exactly once as far as the agent can tell.** Replay is
+  at-least-once; the receiver dedupes by message id, so a replay is not logged
+  or surfaced twice.
+- **Survives a restart of either side** — the queue and the seen-ids are on disk.
+
+Bounded, since a peer that never returns must not grow the file forever: 500
+messages, given up after 7 days, replayed 100 at a time. Anything given up on is
+counted in `outbox_status` rather than vanishing quietly.
+
+A message is addressed to the peers you were paired with when you sent it, and
+replayed only to peers you have actually paired with — a node that joins later
+does not receive the earlier conversation.
 
 ### Waiting on the other agent
 
@@ -396,6 +428,7 @@ npm test                 # unit + integration suite (offline)
 npm run smoke            # Hyperswarm two-node sync (needs internet)
 npm run smoke:merge      # concurrent merge, same-key resolution, set adds
 npm run smoke:claim      # two agents racing the same backlog
+npm run smoke:outbox     # a message left for an offline peer
 npm run smoke:doc        # living-doc bridge (mock Google Docs, no keys)
 ```
 

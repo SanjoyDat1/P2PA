@@ -33,7 +33,8 @@
     "smoke": "tsx scripts/smoke-p2p.ts",
     "smoke:doc": "tsx scripts/smoke-doc.ts",
     "smoke:merge": "tsx scripts/smoke-merge.ts",
-    "smoke:claim": "tsx scripts/smoke-claim.ts"
+    "smoke:claim": "tsx scripts/smoke-claim.ts",
+    "smoke:outbox": "tsx scripts/smoke-outbox.ts"
   },
   "engines": {
     "node": ">=18"

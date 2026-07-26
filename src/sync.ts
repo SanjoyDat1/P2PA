@@ -14,6 +14,7 @@ import {
 } from "./types.js";
 import { nodeIdFromPublicKey } from "./hlc.js";
 import type { EventBus } from "./events.js";
+import type { Outbox } from "./outbox.js";
 import {
   describeClaim,
   isClaimKey,
@@ -29,6 +30,8 @@ export interface SyncServices {
   contention?: ContentionLog;
   /** Wakes agents blocked on peer activity. Absent in tests that do not need it. */
   events?: EventBus;
+  /** Holds messages until the recipient confirms them. */
+  outbox?: Outbox;
 }
 
 export type ApplyResult =
@@ -461,6 +464,124 @@ export function releaseTask(
   });
   services.log.rewriteClaims(services.store.listClaims());
   return { ok: true, view };
+}
+
+export interface MessageDelivery {
+  id: string | null;
+  /** Peers the message reached immediately. */
+  deliveredNow: number;
+  /** Still queued for peers that were not reachable. */
+  queued: boolean;
+}
+
+/**
+ * Send a message, queuing it first so a disconnect cannot lose it.
+ *
+ * Queued before it is sent, not after: a message written to a socket that
+ * closes mid-flight is exactly the case the outbox exists for, and it is only
+ * removed once the recipient says it arrived.
+ */
+export function sendMessage(
+  services: SyncServices,
+  text: string,
+  recipients: string[] = [],
+): MessageDelivery {
+  services.log.syncMessage("Local", text);
+
+  if (!services.outbox) {
+    services.p2p?.broadcast({ type: "message", v: PROTOCOL_VERSION, text });
+    return { id: null, deliveredNow: services.p2p?.connectionCount() ?? 0, queued: false };
+  }
+
+  // Addressed to whoever is paired now, so a peer added later does not receive
+  // a backlog of conversation it was never part of.
+  const message = services.outbox.enqueue(text, recipients);
+  let delivered = 0;
+  for (const key of services.p2p?.connectedKeys() ?? []) {
+    const sent = services.p2p?.sendTo(key, {
+      type: "message",
+      v: PROTOCOL_VERSION,
+      text,
+      id: message.id,
+    });
+    if (sent === true) delivered += 1;
+  }
+  return { id: message.id, deliveredNow: delivered, queued: true };
+}
+
+/** Push everything a peer has not confirmed. Called when it connects. */
+export function replayOutbox(
+  services: SyncServices,
+  publicKeyHex: string,
+): number {
+  if (!services.outbox || !services.p2p) return 0;
+  const pending = services.outbox.pendingFor(publicKeyHex);
+  let sent = 0;
+  for (const message of pending) {
+    const ok = services.p2p.sendTo(publicKeyHex, {
+      type: "message",
+      v: PROTOCOL_VERSION,
+      text: message.text,
+      id: message.id,
+    });
+    if (!ok) break;
+    sent += 1;
+  }
+  return sent;
+}
+
+/** Confirm delivery so the sender can stop retrying. */
+export function handleAck(
+  services: SyncServices,
+  publicKeyHex: string | null,
+  ids: string[],
+): number {
+  if (!services.outbox || publicKeyHex === null) return 0;
+  return services.outbox.ack(publicKeyHex, ids);
+}
+
+/**
+ * Record an inbound message and confirm it.
+ *
+ * Replay is at-least-once by design, so the receiver is what makes it look
+ * exactly-once: a message whose id has already been handled is acknowledged
+ * again but not logged again.
+ */
+export function receiveMessage(
+  services: SyncServices,
+  text: string,
+  id: string | undefined,
+  peer: AuditPeer | undefined,
+  senderPublicKey: string | null,
+): { duplicate: boolean } {
+  // Dedupe is scoped to the sender: a shared id space would let one peer
+  // pre-claim an id so another peer's real message is dropped as a duplicate.
+  const duplicate =
+    id !== undefined &&
+    senderPublicKey !== null &&
+    services.outbox?.isDuplicate(senderPublicKey, id) === true;
+
+  if (!duplicate) {
+    services.log.syncMessage("Peer", text, peer);
+    services.events?.emit({
+      kind: "message",
+      peer: peer?.fingerprint ?? null,
+      text,
+    });
+    if (id !== undefined && senderPublicKey !== null) {
+      services.outbox?.markSeen(senderPublicKey, id);
+    }
+  }
+
+  // Acknowledged either way — a duplicate means our previous ack was lost.
+  if (id !== undefined && senderPublicKey !== null) {
+    services.p2p?.sendTo(senderPublicKey, {
+      type: "ack",
+      v: PROTOCOL_VERSION,
+      ids: [id],
+    });
+  }
+  return { duplicate };
 }
 
 /** Record a peer/local message in the Audit Trail and optionally broadcast. */

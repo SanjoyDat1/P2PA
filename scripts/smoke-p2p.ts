@@ -62,7 +62,7 @@ async function main(): Promise<void> {
         applyPeerSnapshot({ store, log }, envelope.ops, "Peer");
       } else if (envelope.type === "update") {
         handleInboundOps({ store, log }, envelope.ops, "Peer");
-      } else {
+      } else if (envelope.type === "message") {
         recordMessage({ store, log }, envelope.text, "Peer", false);
       }
     };

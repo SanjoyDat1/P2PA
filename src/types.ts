@@ -36,11 +36,13 @@ export type AuditAction =
 /**
  * Wire protocol version.
  *
- * Bumped from the `_version`-counter protocol, whose merge rule could not
- * express two writes happening at once. An envelope without it comes from an
- * incompatible build and is refused rather than half-understood.
+ * v2 replaced the `_version`-counter protocol, whose merge rule could not
+ * express two writes happening at once. v3 adds message ids and the `ack`
+ * envelope that make delivery durable — a v2 peer would silently never
+ * acknowledge anything, so the sender would retry the same message on every
+ * reconnect for a week. Refusing outright is the honest failure.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** Document key used by the retired counter protocol; dropped on hydrate. */
 export const LEGACY_VERSION_KEY = "_version";
@@ -318,6 +320,16 @@ export const PeerEnvelopeSchema = z.discriminatedUnion("type", [
     type: z.literal("message"),
     v: z.literal(PROTOCOL_VERSION),
     text: z.string().min(1).max(MAX_PAYLOAD_BYTES),
+    /**
+     * Optional so a build without an outbox still interoperates. Present, it
+     * lets the receiver drop a replay and confirm receipt.
+     */
+    id: z.string().min(1).max(64).optional(),
+  }),
+  z.object({
+    type: z.literal("ack"),
+    v: z.literal(PROTOCOL_VERSION),
+    ids: z.array(z.string().min(1).max(64)).min(1).max(200),
   }),
   z.object({
     type: z.literal("snapshot"),

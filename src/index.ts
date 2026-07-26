@@ -11,10 +11,12 @@
  * Prefer one writer: either the PM2 daemon OR `p2pa mcp`, not both mutating.
  */
 import { appendFileSync, createWriteStream, chmodSync } from "node:fs";
+import { join } from "node:path";
 import type { WriteStream } from "node:fs";
 import { resolveRuntimeOptions } from "./daemon-options.js";
 import {
   ensureConfigDir,
+  getConfigDir,
   getDaemonErrorLogPath,
   readConfig,
   resolveAuthMode,
@@ -26,11 +28,14 @@ import { MarkdownLog } from "./markdown-log.js";
 import { P2PNode, describePeer, type PeerIdentity } from "./p2p.js";
 import { ContentionLog } from "./conflicts.js";
 import { EventBus } from "./events.js";
+import { Outbox } from "./outbox.js";
 import { createMcpServer, startMcpServer } from "./mcp-server.js";
 import {
   applyPeerSnapshot,
+  handleAck,
   handleInboundOps,
-  recordMessage,
+  receiveMessage,
+  replayOutbox,
 } from "./sync.js";
 import { DocBridge } from "./doc/bridge.js";
 import {
@@ -88,6 +93,7 @@ function tryCreateDocBridge(services: {
   p2p?: P2PNode;
   contention?: ContentionLog;
   events?: EventBus;
+  outbox?: Outbox;
 }): DocBridge | undefined {
   const config = readConfig();
   const doc = config?.doc;
@@ -144,6 +150,7 @@ async function main(): Promise<void> {
   const log = new MarkdownLog(options.contextFile);
   const contention = new ContentionLog();
   const events = new EventBus();
+  const outbox = new Outbox(join(getConfigDir(), "outbox.json"));
   log.ensureInitialized();
 
   const replica = log.readReplicaState();
@@ -192,8 +199,23 @@ async function main(): Promise<void> {
     isPeerAllowed: (pubkey) => allowlist.isAllowed(pubkey),
     lookupPeer: (pubkey) => allowlist.lookup(pubkey),
     getActiveState: () => store.export(),
+    onPeerConnect: (peer: PeerIdentity) => {
+      if (peer.pubkey === null) return;
+      if (authMode !== "strict" || !allowlist.isAllowed(peer.pubkey)) {
+        // Message history is only replayed to a peer we have actually paired
+        // with; in open mode any node that learns the topic can connect.
+        return;
+      }
+      const replayed = replayOutbox({ store, log, p2p, outbox }, peer.pubkey);
+      if (replayed > 0) {
+        console.error(
+          `[p2pa:outbox] replayed ${replayed} undelivered message(s) to ${describePeer(peer)}`,
+        );
+      }
+      outbox.prune(allowlist.keys());
+    },
     onPeerMessage: (envelope: PeerEnvelope, peer: PeerIdentity) => {
-      handlePeerEnvelope({ store, log, contention, events }, envelope, peer);
+      handlePeerEnvelope({ store, log, contention, events, outbox, p2p }, envelope, peer);
     },
   });
 
@@ -211,7 +233,7 @@ async function main(): Promise<void> {
 
   await p2p.start();
 
-  docBridge = tryCreateDocBridge({ store, log, p2p, contention, events });
+  docBridge = tryCreateDocBridge({ store, log, p2p, contention, events, outbox });
 
   if (daemon) {
     console.error(
@@ -221,6 +243,7 @@ async function main(): Promise<void> {
       try {
         docBridge?.stop();
         releaseDocBridgeLock();
+        outbox.flush();
         events.close();
         allowlist.close();
         await p2p.close();
@@ -244,6 +267,8 @@ async function main(): Promise<void> {
     p2p,
     contention,
     events,
+    outbox,
+    recipients: () => allowlist.keys(),
     doc: docBridge,
   });
   await startMcpServer(mcp);
@@ -255,6 +280,7 @@ async function main(): Promise<void> {
   const shutdownMcp = async (): Promise<void> => {
     docBridge?.stop();
     releaseDocBridgeLock();
+    outbox.flush();
     events.close();
     allowlist.close();
     await p2p.close();
@@ -274,6 +300,8 @@ function handlePeerEnvelope(
     log: MarkdownLog;
     contention: ContentionLog;
     events: EventBus;
+    outbox: Outbox;
+    p2p: P2PNode;
   },
   envelope: PeerEnvelope,
   peer: PeerIdentity,
@@ -315,9 +343,25 @@ function handlePeerEnvelope(
     return;
   }
 
-  recordMessage(services, envelope.text, "Peer", false, audit);
+  if (envelope.type === "ack") {
+    const acked = handleAck(services, peer.pubkey, envelope.ids);
+    if (acked > 0) {
+      console.error(`[p2pa:outbox] ${remoteLabel} confirmed ${acked} message(s)`);
+    }
+    return;
+  }
+
+  const { duplicate } = receiveMessage(
+    services,
+    envelope.text,
+    envelope.id,
+    audit,
+    peer.pubkey,
+  );
   console.error(
-    `[p2pa] peer message from ${remoteLabel} (${envelope.text.length} chars)`,
+    duplicate
+      ? `[p2pa] ignoring replayed message from ${remoteLabel}`
+      : `[p2pa] peer message from ${remoteLabel} (${envelope.text.length} chars)`,
   );
 }
 

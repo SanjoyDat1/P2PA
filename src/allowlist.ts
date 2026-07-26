@@ -24,6 +24,8 @@ export interface Allowlist {
   lookup(pubkeyHex: string): { label: string } | undefined;
   /** Number of allowlisted peers. */
   readonly size: number;
+  /** Public keys of every allowlisted peer, for outbox delivery accounting. */
+  keys(): string[];
   /** Re-read `config.json` immediately. Returns true if the set changed. */
   reload(): boolean;
   /** Register a callback fired after an on-disk change is picked up. */
@@ -108,6 +110,7 @@ export function createAllowlist(): Allowlist {
   }
 
   return {
+    keys: () => [...peers.keys()],
     isAllowed: (pubkeyHex: string) => peers.has(pubkeyHex),
     lookup: (pubkeyHex: string) => {
       const entry = peers.get(pubkeyHex);
