@@ -8,3 +8,6 @@ shared_context.md
 .env.*
 **/google-sa.json
 **/*-sa.json
+
+# Rotated audit history — same content as shared_context.md
+*.archive.md

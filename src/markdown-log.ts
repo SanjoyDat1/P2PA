@@ -1,4 +1,5 @@
 import {
+  constants,
   mkdirSync,
   existsSync,
   readFileSync,
@@ -20,6 +21,32 @@ import type {
   ContextState,
   Source,
 } from "./types.js";
+
+/**
+ * Audit entries kept in the live file.
+ *
+ * The whole document is re-rendered on every mutation, so an audit trail that
+ * grows without limit makes each write proportional to the entire history —
+ * the cost climbs quietly until the node is slow for reasons nobody can see.
+ * Older entries move to a sidecar instead of being discarded, so the record is
+ * still complete.
+ */
+export const MAX_AUDIT_ENTRIES = 200;
+
+/** Entries trimmed per write, so one write never does an unbounded amount. */
+export const MAX_ARCHIVE_BATCH = 500;
+
+/**
+ * Byte budget for the live audit section.
+ *
+ * Counting entries is not enough: a single peer message may be up to
+ * MAX_PAYLOAD_BYTES, so 200 large entries would leave a file hundreds of
+ * megabytes wide that is re-read and re-written on every mutation.
+ */
+export const MAX_AUDIT_BYTES = 256 * 1024;
+
+/** Message text kept in an audit entry. The full text stays in the outbox log. */
+export const MAX_AUDIT_TEXT = 4_000;
 
 const TITLE = "# P2PA Shared Context";
 const ACTIVE_HEADING = "## Active State";
@@ -87,6 +114,7 @@ export class MarkdownLog {
     if (state !== undefined) parts.active = jsonBlock(state);
     if (replica !== undefined) parts.replica = replicaBlock(replica);
     parts.audit = `${parts.audit}\n\n${renderAuditEntry(entry)}`.trim();
+    parts.audit = this.rotateAudit(parts.audit);
     atomicWrite(this.filePath, renderDoc(parts));
   }
 
@@ -127,6 +155,53 @@ export class MarkdownLog {
       state,
       replica,
     );
+  }
+
+  /** Where trimmed audit entries go. Append-only, so rotation stays cheap. */
+  get archivePath(): string {
+    return this.filePath.replace(/\.md$/, "") + ".archive.md";
+  }
+
+  /**
+   * Move the oldest entries to the archive once the live section is full.
+   *
+   * Appending to the sidecar is O(what moved) rather than O(history), which is
+   * the whole point — the live file is what gets rewritten on every mutation.
+   */
+  private rotateAudit(audit: string): string {
+    const entries = splitAuditEntries(audit);
+    if (
+      entries.length <= MAX_AUDIT_ENTRIES &&
+      byteLength(entries) <= MAX_AUDIT_BYTES
+    ) {
+      return audit;
+    }
+
+    let overflow = Math.min(
+      entries.length - MAX_AUDIT_ENTRIES,
+      MAX_ARCHIVE_BATCH,
+    );
+    // Then keep trimming until the remainder also fits the byte budget.
+    while (
+      overflow < entries.length - 1 &&
+      overflow < MAX_ARCHIVE_BATCH &&
+      byteLength(entries.slice(overflow)) > MAX_AUDIT_BYTES
+    ) {
+      overflow += 1;
+    }
+    const moved = entries.slice(0, overflow);
+    const kept = entries.slice(overflow);
+
+    try {
+      appendEntries(this.archivePath, `${moved.join("\n\n")}\n\n`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Losing history is worse than an oversized file, so keep the entries.
+      console.error(`[markdown] could not archive audit entries: ${message}`);
+      return audit;
+    }
+    // Say so in the file, so a reader can see history was moved rather than lost.
+    return `${ROTATION_MARKER}\n\n${kept.join("\n\n")}`;
   }
 
   /** Rewrite ## Claims from the live leases (omit the section when empty). */
@@ -372,6 +447,40 @@ function safe(value: string): string {
   return sanitizeLabel(value);
 }
 
+/**
+ * Split an audit body into whole entries.
+ *
+ * Entries begin with a `### [` heading and may span several lines, so this
+ * cannot be a line split — and peer-supplied text is sanitized upstream
+ * precisely so it cannot forge one of these boundaries.
+ */
+const ROTATION_MARKER =
+  "<!-- older entries moved to shared_context.archive.md -->";
+
+function byteLength(entries: string[]): number {
+  let total = 0;
+  for (const entry of entries) total += Buffer.byteLength(entry, "utf8") + 2;
+  return total;
+}
+
+function splitAuditEntries(audit: string): string[] {
+  const trimmed = audit.trim();
+  if (trimmed.length === 0) return [];
+  const entries: string[] = [];
+  let current: string[] = [];
+  for (const line of trimmed.split("\n")) {
+    // The marker is regenerated on each rotation; never carry it forward.
+    if (line === ROTATION_MARKER) continue;
+    if (line.startsWith("### [") && current.length > 0) {
+      entries.push(current.join("\n").trim());
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length > 0) entries.push(current.join("\n").trim());
+  return entries.filter((entry) => entry.length > 0);
+}
+
 function renderAuditEntry(entry: AuditEntry): string {
   const ts = formatTimestamp(new Date());
   const head = `### [${ts}] - [SOURCE: ${formatSource(entry)}]`;
@@ -428,7 +537,13 @@ function renderAuditEntry(entry: AuditEntry): string {
   }
 
   let block = `${head} - [ACTION: Message]\n- **Content:**\n`;
-  for (const line of entry.text.split(/\r\n|\r|\n|\u2028|\u2029/)) {
+  // Truncated: an entry is a summary for a human reading the file, and a peer
+  // may send up to a megabyte at a time.
+  const text =
+    entry.text.length > MAX_AUDIT_TEXT
+      ? `${entry.text.slice(0, MAX_AUDIT_TEXT)} …[truncated]`
+      : entry.text;
+  for (const line of text.split(/\r\n|\r|\n|\u2028|\u2029/)) {
     block += `> ${line}\n`;
   }
   return block;
@@ -440,6 +555,28 @@ function formatTimestamp(date: Date): string {
     `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
     `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
   );
+}
+
+/**
+ * Append to the archive without following a symlink.
+ *
+ * `resolveContextFile` refuses a symlinked context file, but the sidecar name is
+ * derived by string surgery and never went through it — so a planted
+ * `shared_context.archive.md` symlink would redirect the append anywhere the
+ * user can write.
+ */
+function appendEntries(filePath: string, body: string): void {
+  const fd = openSync(filePath, appendFlags(), 0o600);
+  try {
+    writeFileSync(fd, body, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function appendFlags(): number {
+  const { O_APPEND, O_CREAT, O_WRONLY, O_NOFOLLOW } = constants;
+  return O_APPEND | O_CREAT | O_WRONLY | (O_NOFOLLOW ?? 0);
 }
 
 function atomicWrite(filePath: string, content: string): void {

@@ -28,6 +28,7 @@ import { MarkdownLog } from "./markdown-log.js";
 import { P2PNode, describePeer, type PeerIdentity } from "./p2p.js";
 import { ContentionLog } from "./conflicts.js";
 import { EventBus } from "./events.js";
+import { acquireLock, releaseLock, STATE_WRITER_LOCK } from "./lock.js";
 import { Outbox } from "./outbox.js";
 import { createMcpServer, startMcpServer } from "./mcp-server.js";
 import {
@@ -142,6 +143,27 @@ async function main(): Promise<void> {
 
   const options = resolveRuntimeOptions();
 
+  // Two writers each hold a full copy of the document and rewrite it whole, so
+  // running both the daemon and `p2pa mcp` silently loses whichever saved
+  // first. Fail loudly at startup instead of corrupting quietly.
+  const writerLock = acquireLock(STATE_WRITER_LOCK);
+  if (!writerLock.acquired) {
+    const owner = writerLock.heldBy ? ` (pid ${writerLock.heldBy})` : "";
+    console.error(
+      `[p2pa] another P2PA process is already writing this context${owner}.\n` +
+        "       Run either the background daemon or `p2pa mcp`, not both:\n" +
+        "         p2pa stop     # if the daemon is running\n" +
+        "       Then start this one again.\n" +
+        `       Lock file: ${join(getConfigDir(), "state-writer.lock")}`,
+    );
+    process.exit(1);
+  }
+  // A stale lock is detected by pid anyway, but clearing it on exit keeps the
+  // next start from having to reason about it.
+  process.on("exit", () => {
+    releaseLock(STATE_WRITER_LOCK);
+  });
+
   // Identity first: the node's public key seeds the clock that stamps every
   // write, and stamps are what let concurrent edits merge deterministically.
   const identity = loadOrCreateIdentity();
@@ -245,9 +267,11 @@ async function main(): Promise<void> {
         releaseDocBridgeLock();
         outbox.flush();
         events.close();
+        releaseLock(STATE_WRITER_LOCK);
         allowlist.close();
         await p2p.close();
       } finally {
+        releaseLock(STATE_WRITER_LOCK);
         logStream?.end();
         process.exit(0);
       }
@@ -284,6 +308,7 @@ async function main(): Promise<void> {
     events.close();
     allowlist.close();
     await p2p.close();
+    releaseLock(STATE_WRITER_LOCK);
     process.exit(0);
   };
   process.on("SIGINT", () => {

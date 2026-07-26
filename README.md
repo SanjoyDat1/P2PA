@@ -40,14 +40,14 @@ Multi-agent collaboration is still broken in three ways:
 graph TD
     subgraph MachineA [Machine A]
         AgentA[Local agent / Cursor] <-->|stdio MCP| MCPA[p2pa mcp]
-        MCPA <--> StoreA[(In-memory state)]
-        MCPA -->|Active State + Audit Trail| LogA["~/.p2pa/shared_context.md"]
+        MCPA <--> StoreA[(CRDT document + leases)]
+        MCPA -->|state · claims · audit| LogA["~/.p2pa/shared_context.md"]
     end
 
     subgraph MachineB [Machine B]
         AgentB[Local agent / Cursor] <-->|stdio MCP| MCPB[p2pa mcp]
-        MCPB <--> StoreB[(In-memory state)]
-        MCPB -->|Active State + Audit Trail| LogB["~/.p2pa/shared_context.md"]
+        MCPB <--> StoreB[(CRDT document + leases)]
+        MCPB -->|state · claims · audit| LogB["~/.p2pa/shared_context.md"]
     end
 
     MCPA <-->|Hyperswarm · NDJSON · CRDT ops| MCPB
@@ -60,73 +60,152 @@ graph TD
 | **MCP (foreground)** | `p2pa mcp` | Connecting Cursor / Claude — owns clean stdio |
 | **Daemon (background)** | `p2pa start` | Optional Hyperswarm sync via PM2 (no MCP stdio) |
 
-Prefer **one writer** at a time. Agents should use `p2pa mcp` via MCP config; use the daemon only when you want background sync without an IDE client.
+**Run one, not both.** Both modes write the same files, so P2PA takes a writer
+lock at startup and the second one exits with an explanation rather than
+quietly overwriting the first. Use `p2pa mcp` when an IDE agent is driving;
+use the daemon when you want background sync without one.
 
 ---
 
-## Quick start
+## Try it in two minutes (one machine)
+
+No pairing, no second computer — this just proves the merge engine and the
+work-leases do what they claim:
+
+```bash
+git clone https://github.com/SanjoyDat1/P2PA.git
+cd P2PA
+npm install
+npm test                 # 228 tests, fully offline
+
+npm run smoke:merge      # two replicas writing at once, no lost work
+npm run smoke:claim      # two agents racing one backlog, nobody duplicates
+npm run smoke:outbox     # a message left for an agent that is offline
+```
+
+`npm test` needs no network: the peer-authentication tests run a real
+`hyperdht` testnet in-process.
+
+---
+
+## Running it for real (two machines)
 
 ### 1. Install
 
 ```bash
 npm install -g p2pa
-# or from this repo:
+```
+
+Or from a clone:
+
+```bash
 npm install && npm run build && npm link
 ```
 
-Requires **Node.js 18+**.
+Requires **Node.js 18+**. Everything lives in `~/.p2pa/`.
 
-### 2. Pair two machines
+### 2. Pair the two machines
 
-Pairing is **mutual and key-based**: each side allowlists the other's public key, and only allowlisted peers can connect.
+Pairing is **mutual and key-based**. Each side allowlists the other's public
+key, and only allowlisted keys can connect — knowing the topic is not enough.
 
-On machine A:
-
-```bash
-p2pa pair            # prints an invite token — send it to B
-```
-
-On machine B:
+On machine **A**:
 
 ```bash
-p2pa pair <A's token>   # allowlists A, adopts A's topic, prints B's token
+p2pa pair                 # prints an invite token
 ```
 
-Back on machine A:
+Send that token to **B** over a channel you already trust (it carries the
+pairing topic, so treat it like a password).
+
+On machine **B**:
 
 ```bash
-p2pa pair <B's token>   # allowlists B — pairing complete
-p2pa peers              # confirm
+p2pa pair <A's token>     # allowlists A, adopts A's topic, prints B's token
 ```
 
-Then start syncing:
+Back on **A**:
 
 ```bash
-p2pa start           # background daemon (both machines)
+p2pa pair <B's token>     # allowlists B — pairing complete
+p2pa peers                # confirm both directions
 ```
 
-An invite token carries the pairing topic, so **treat it like a password** and send it over a channel you already trust. See [Peer authentication](#peer-authentication) for the full model.
+Then lock it down (this is the default for new installs, but check):
 
-### 3. Connect your IDE agent
+```bash
+p2pa auth strict
+```
+
+### 3. Point your agent at it
 
 ```bash
 p2pa connect
 ```
 
-Paste the printed JSON into:
+That prints a ready-made MCP server block. Paste it into:
 
-- **Cursor** → MCP settings  
-- **Claude Desktop** → `claude_desktop_config.json`
+- **Claude Code** — `claude mcp add p2pa -- p2pa mcp`, or the printed JSON in `.mcp.json`
+- **Cursor** — Settings → MCP
+- **Claude Desktop** — `claude_desktop_config.json`
 
-That config runs `p2pa mcp` over stdio so tools appear in the agent.
+The config runs `p2pa mcp` over stdio, so the tools appear inside the agent.
 
-### 4. Watch agents collaborate
+### 4. Choose one process, not two
+
+| You want | Run | Notes |
+|---|---|---|
+| An IDE agent driving it | `p2pa mcp` (via the MCP config above) | Started for you by the client |
+| Background sync, no IDE | `p2pa start` | PM2 daemon |
+
+Both write the same files, so P2PA takes a **writer lock** at startup: whichever
+starts second exits with an explanation instead of silently overwriting the
+first. If you get that message, `p2pa stop` the daemon and retry.
+
+### 5. Watch it work
 
 ```bash
-p2pa log          # live tail of the markdown audit log
-p2pa status       # daemon online? topic fingerprint?
-p2pa stop         # stop the PM2 daemon
+p2pa status        # identity, topic, auth mode, peer count
+p2pa log           # live tail of the audit trail
+p2pa peers         # who you are paired with
+p2pa stop          # stop the daemon
 ```
+
+---
+
+## What a session actually looks like
+
+Two developers, two machines, one backlog. Nothing here is manual bookkeeping —
+the agents do it through the tools.
+
+**Agent A** picks up work and says so:
+
+```
+claim_task("refactor-auth", note: "splitting the token module")
+push_context("status", "auth refactor started")
+```
+
+**Agent B**, on the other machine, checks before starting anything:
+
+```
+list_claims()            → refactor-auth is held by a3f9c1b2
+claim_task("write-tests") → granted, different task
+```
+
+**Agent B** finishes and goes idle, rather than polling:
+
+```
+release_task("write-tests")
+await_peer_event()       → blocks…
+                         ← { kind: "claim", taskId: "update-docs", peer: "a3f9c1b2" }
+```
+
+If B's machine is asleep when A sends a message, A does not need to resend —
+the message is queued and delivered when B comes back.
+
+Everything above is also written to `~/.p2pa/shared_context.md` in plain
+Markdown, attributed to the peer that did it, so a human can read the whole
+session without any tooling.
 
 ---
 
@@ -156,7 +235,10 @@ Config and state live under **`~/.p2pa/`** (mode `0700`):
 |------|---------|
 | `config.json` | Pairing topic, auth mode, peer allowlist, optional doc link (`0600`) |
 | `identity.json` | This node's 32-byte identity seed (`0600`) — never share |
-| `shared_context.md` | Active State + Replica State + Concurrent Updates + Audit Trail |
+| `shared_context.md` | Active State + Replica State + Claims + Concurrent Updates + Audit Trail |
+| `shared_context.archive.md` | Older audit entries, rolled off the live file |
+| `outbox.json` | Messages awaiting confirmation (0600) |
+| `state-writer.lock` | Held by whichever process is writing |
 | `daemon-error.log` | Daemon diagnostics (not mixed into MCP stdout) |
 
 Override the config directory with `P2PA_CONFIG_DIR` (must stay under your home directory).
@@ -200,7 +282,7 @@ Changing the **allowlist** is picked up live by running nodes — pairing a peer
 Every peer-sourced entry in the audit trail now records which peer acted, keyed by the Noise-authenticated public key:
 
 ```
-### [2026-07-25 10:14:02] - [SOURCE: Peer a3f9c1b2 (sanjoy-laptop)] - [ACTION: State Patch]
+### [2026-07-25 10:14:02] - [SOURCE: Peer a3f9c1b2 (sanjoy-laptop)] - [ACTION: State Update]
 ```
 
 Labels are peer-supplied and sanitized (control characters and Markdown structure stripped) so a peer cannot forge audit entries through its own name. The fingerprint is the identity; the label is a convenience.
@@ -262,24 +344,45 @@ Optional: `P2PA_DOC_POLL_MS` (default `4000`).
 
 Once connected, agents can call:
 
+**Shared state**
+
 | Tool | What it does |
 |------|----------------|
 | `push_context` | Set a top-level key and broadcast it |
+| `pull_context` | Read one key, or the whole shared document |
 | `delete_context` | Tombstone a key so a stale replica cannot resurrect it |
-| `set_add` / `set_remove` | Add-wins set operations for lists two agents both append to |
-| `pull_context` | Read one key or the entire in-memory state |
-| `send_peer_message` | Send a text message into the peer’s audit trail |
-| `check_conflicts` | List recent concurrent updates (already settled; informational) |
+| `set_add` / `set_remove` | Add-wins set operations, for lists two agents both append to |
 | `override_context` | Impose your own values when the automatic winner is wrong by intent |
+| `check_conflicts` | Recent concurrent updates — already settled, informational |
+
+**Dividing work**
+
+| Tool | What it does |
+|------|----------------|
 | `claim_task` | Take a lease on a task so a peer does not start the same work |
 | `release_task` | Hand a task back before its lease expires |
 | `list_claims` | See which tasks are in flight and who holds them |
+
+**Talking to the other agent**
+
+| Tool | What it does |
+|------|----------------|
 | `send_peer_message` | Message your peers; queued and retried if they are offline |
-| `outbox_status` | Messages still awaiting confirmation |
 | `await_peer_event` | Block until a peer acts, then return what they did |
 | `recent_peer_events` | Catch up on peer activity without blocking |
+| `outbox_status` | Messages still awaiting confirmation |
+
+**Introspection**
+
+| Tool | What it does |
+|------|----------------|
 | `sync_health` | Replica id, content hash, peer count — equal hashes mean equal state |
 | `read_context_history` | Read the last *N* lines of the local markdown log |
+
+**Living doc** (optional, see [below](#living-doc-google-docs-steering))
+
+| Tool | What it does |
+|------|----------------|
 | `doc_publish` | Push status / plan / agent_log to the linked Google Doc |
 | `doc_read_steering` | Read HUMAN directives (optional force poll) |
 | `doc_status` | Living-doc link + poll health (no secrets) |
@@ -393,7 +496,13 @@ The file has five sections:
 2. **Replica State** — the same document plus per-key stamps (machine-managed)
 3. **Claims** — which tasks are in flight and who holds them (omitted when empty)
 4. **Concurrent Updates** — recent settled contention (omitted when empty)
-5. **Audit Trail** — append-only history of patches, messages, and resolutions
+5. **Audit Trail** — recent history of updates, messages, claims, and refusals
+
+The audit trail is capped so the live file stays small and every write stays
+cheap — the whole document is re-rendered on each mutation, so an unbounded
+history would make the node slower and slower for no visible reason. Older
+entries roll into `shared_context.archive.md` rather than being discarded, so
+the record stays complete.
 
 Tail it during development:
 
@@ -411,6 +520,13 @@ p2pa log
 - **`identity.json` is your node's private key material.** Never copy it between machines — two nodes sharing a keypair cannot be told apart or revoked independently.
 - The **Google Doc link is also a capability** — with “anyone with the link = editor,” anyone who has the URL can steer agents via HUMAN directives. Rotate by creating a new doc + `p2pa doc unlink`.
 - Service account JSON (`P2PA_GOOGLE_SA_JSON`) must stay on disk / in MCP env only — never in Active State, the Doc, or P2P patches.
+- **An allowlisted peer is trusted.** It can write any state key, take a lease
+  you hold, and read everything you sync. The allowlist is the boundary — pair
+  with people, not with topics you found somewhere.
+- **`outbox.json` holds message text on disk** (0600, inside the 0700 config
+  directory). Message history is only replayed to peers you have paired with.
+- Peers never relay for each other, which is what makes unsigned envelopes safe.
+  If relaying is ever added, per-envelope signatures become mandatory.
 - Config directory defaults to `0700`; `config.json` is written as `0600`.
 - Do not put credentials or production secrets into shared context.
 - Background daemon logs go to `daemon-error.log` so MCP stdout stays a clean JSON-RPC stream.
@@ -424,7 +540,7 @@ git clone <your-repo-url>
 cd P2PA
 npm install
 npm run build
-npm test                 # unit + integration suite (offline)
+npm test                 # 228 tests, unit + integration, fully offline
 npm run smoke            # Hyperswarm two-node sync (needs internet)
 npm run smoke:merge      # concurrent merge, same-key resolution, set adds
 npm run smoke:claim      # two agents racing the same backlog
@@ -434,16 +550,38 @@ npm run smoke:doc        # living-doc bridge (mock Google Docs, no keys)
 
 `npm test` runs entirely offline — the peer-authentication integration tests spin up an in-process `hyperdht` testnet, so they exercise the real firewall against real connections without touching the public DHT.
 
+```bash
+npm run typecheck        # tsc over src, scripts and test
+npm run build            # compile to dist/
+```
+
 Package entrypoint: `p2pa` → `dist/cli.js`.
+
+**Layout**
+
+| Path | What lives there |
+|---|---|
+| `src/crdt.ts`, `src/hlc.ts` | Merge engine: per-key registers, hybrid logical clocks |
+| `src/claim.ts` | Work leases |
+| `src/events.ts` | Peer-activity bus behind `await_peer_event` |
+| `src/outbox.ts` | Durable messaging |
+| `src/sync.ts` | Ties the above to the transport and the audit trail |
+| `src/p2p.ts` | Hyperswarm transport, peer firewall |
+| `src/mcp-server.ts` | The agent-facing tool surface |
+| `src/markdown-log.ts` | The human-readable file |
+
+Contributions welcome. The test suite is the spec — every behaviour above has a
+test that fails if you remove the guard that provides it.
 
 ---
 
 ## Roadmap ideas
 
-- Notion / other living-doc adapters  
-- Single-writer lock when daemon + MCP both run (partially covered by doc-bridge.lock)  
-- Optional Streamable HTTP transport alongside stdio  
-- Richer CRDT or vector-clock merge policies  
+- Notion and other living-doc adapters
+- Optional Streamable HTTP transport alongside stdio
+- Delta sync on reconnect (peers currently exchange a full stamped snapshot)
+- Signed envelopes, which become **required** if relaying is ever added — today
+  a node only ever speaks for itself, which is what makes unsigned ops safe
 
 ---
 
