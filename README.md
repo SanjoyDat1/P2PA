@@ -28,6 +28,7 @@ Multi-agent collaboration is still broken in three ways:
 - **Per-key CRDT merge** — Every key carries its own hybrid logical clock. Two agents writing different keys never conflict; two agents writing the same key resolve to the same winner on every replica, with no arbitration step.
 - **Add-wins sets** — Concurrent appends to a list all survive, instead of one agent's entries overwriting the other's.
 - **Work-claiming leases** — An agent claims a task before starting it, so two agents never do the same job. Leases expire on their own, so a crashed agent cannot block the backlog.
+- **Event-driven, not polling** — An agent can block until the other one actually does something, instead of hoping it remembers to check.
 - **Human-readable audit log** — Every change lands in `~/.p2pa/shared_context.md`, attributed to the peer that made it.
 
 ---
@@ -272,6 +273,8 @@ Once connected, agents can call:
 | `claim_task` | Take a lease on a task so a peer does not start the same work |
 | `release_task` | Hand a task back before its lease expires |
 | `list_claims` | See which tasks are in flight and who holds them |
+| `await_peer_event` | Block until a peer acts, then return what they did |
+| `recent_peer_events` | Catch up on peer activity without blocking |
 | `sync_health` | Replica id, content hash, peer count — equal hashes mean equal state |
 | `read_context_history` | Read the last *N* lines of the local markdown log |
 | `doc_publish` | Push status / plan / agent_log to the linked Google Doc |
@@ -311,6 +314,26 @@ Two honest limitations:
   peer can bid a higher generation and take a live lease, just as it can
   overwrite any state key. Displaced leases surface in `check_conflicts` and the
   audit trail. Pair with peers you trust.
+
+### Waiting on the other agent
+
+Every other tool is pull-only, which means an agent learns a peer did something
+only if it happens to call one — and an LLM does not do that unprompted. So one
+agent talks and the other never hears it.
+
+```
+Agent B: await_peer_event()                  → blocks
+Agent A: claim_task("refactor-auth")
+Agent B: ← wakes with { kind: "claim", taskId: "refactor-auth", … }
+```
+
+Events carry a `seq`. Pass the highest one you have seen back as `since_seq` and
+nothing is missed between calls, even if you were busy when it happened. A
+timeout returns an empty list rather than an error — "nothing happened" is an
+ordinary answer.
+
+Clients that support MCP resource subscriptions can instead watch
+`p2pa://events` and get nudged on each peer action, without parking a tool call.
 
 ### How merge works
 

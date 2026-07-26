@@ -13,6 +13,7 @@ import {
   type Source,
 } from "./types.js";
 import { nodeIdFromPublicKey } from "./hlc.js";
+import type { EventBus } from "./events.js";
 import {
   describeClaim,
   isClaimKey,
@@ -26,6 +27,8 @@ export interface SyncServices {
   log: MarkdownLog;
   p2p?: P2PNode;
   contention?: ContentionLog;
+  /** Wakes agents blocked on peer activity. Absent in tests that do not need it. */
+  events?: EventBus;
 }
 
 export type ApplyResult =
@@ -285,7 +288,16 @@ function absorb(
       const taskId = taskIdFromKey(key);
       const entry = taskId === null ? undefined : services.store.claim(taskId);
       if (taskId === null || !entry) continue;
-      (describeClaim(taskId, entry, now).released ? released : claimed).push(taskId);
+      const view = describeClaim(taskId, entry, now);
+      (view.released ? released : claimed).push(taskId);
+      if (source === "Peer") {
+        services.events?.emit({
+          kind: view.released ? "release" : "claim",
+          peer: peer?.fingerprint ?? null,
+          taskId,
+          holder: view.holder,
+        });
+      }
     }
     if (claimed.length > 0) {
       services.log.syncMarkdownLog({
@@ -304,6 +316,15 @@ function absorb(
       });
     }
     services.log.rewriteClaims(services.store.listClaims());
+  }
+
+  const stateKeys = touched.filter((key) => !isClaimKey(key));
+  if (stateKeys.length > 0 && source === "Peer") {
+    services.events?.emit({
+      kind: "state",
+      peer: peer?.fingerprint ?? null,
+      keys: stateKeys,
+    });
   }
 
   if (touched.length > 0 && options.snapshot !== true) {
@@ -451,6 +472,13 @@ export function recordMessage(
   peer?: AuditPeer,
 ): void {
   services.log.syncMessage(source, text, peer);
+  if (source === "Peer") {
+    services.events?.emit({
+      kind: "message",
+      peer: peer?.fingerprint ?? null,
+      text,
+    });
+  }
   if (broadcast && services.p2p) {
     services.p2p.broadcast({ type: "message", v: PROTOCOL_VERSION, text });
   }

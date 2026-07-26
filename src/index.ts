@@ -25,6 +25,7 @@ import { ContextStore } from "./store.js";
 import { MarkdownLog } from "./markdown-log.js";
 import { P2PNode, describePeer, type PeerIdentity } from "./p2p.js";
 import { ContentionLog } from "./conflicts.js";
+import { EventBus } from "./events.js";
 import { createMcpServer, startMcpServer } from "./mcp-server.js";
 import {
   applyPeerSnapshot,
@@ -86,6 +87,7 @@ function tryCreateDocBridge(services: {
   log: MarkdownLog;
   p2p?: P2PNode;
   contention?: ContentionLog;
+  events?: EventBus;
 }): DocBridge | undefined {
   const config = readConfig();
   const doc = config?.doc;
@@ -141,6 +143,7 @@ async function main(): Promise<void> {
   const store = new ContextStore(identity.publicKeyHex);
   const log = new MarkdownLog(options.contextFile);
   const contention = new ContentionLog();
+  const events = new EventBus();
   log.ensureInitialized();
 
   const replica = log.readReplicaState();
@@ -190,7 +193,7 @@ async function main(): Promise<void> {
     lookupPeer: (pubkey) => allowlist.lookup(pubkey),
     getActiveState: () => store.export(),
     onPeerMessage: (envelope: PeerEnvelope, peer: PeerIdentity) => {
-      handlePeerEnvelope({ store, log, contention }, envelope, peer);
+      handlePeerEnvelope({ store, log, contention, events }, envelope, peer);
     },
   });
 
@@ -208,7 +211,7 @@ async function main(): Promise<void> {
 
   await p2p.start();
 
-  docBridge = tryCreateDocBridge({ store, log, p2p, contention });
+  docBridge = tryCreateDocBridge({ store, log, p2p, contention, events });
 
   if (daemon) {
     console.error(
@@ -218,6 +221,7 @@ async function main(): Promise<void> {
       try {
         docBridge?.stop();
         releaseDocBridgeLock();
+        events.close();
         allowlist.close();
         await p2p.close();
       } finally {
@@ -239,6 +243,7 @@ async function main(): Promise<void> {
     log,
     p2p,
     contention,
+    events,
     doc: docBridge,
   });
   await startMcpServer(mcp);
@@ -250,6 +255,7 @@ async function main(): Promise<void> {
   const shutdownMcp = async (): Promise<void> => {
     docBridge?.stop();
     releaseDocBridgeLock();
+    events.close();
     allowlist.close();
     await p2p.close();
     process.exit(0);
@@ -267,6 +273,7 @@ function handlePeerEnvelope(
     store: ContextStore;
     log: MarkdownLog;
     contention: ContentionLog;
+    events: EventBus;
   },
   envelope: PeerEnvelope,
   peer: PeerIdentity,
