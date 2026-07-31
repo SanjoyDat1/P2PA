@@ -27,7 +27,12 @@ export const DEFAULT_WAIT_MS = 30_000;
 /** Message text carried inline. The full text is always in the audit trail. */
 export const MAX_EVENT_TEXT = 2_000;
 
-export type PeerEventKind = "state" | "message" | "claim" | "release";
+export type PeerEventKind =
+  | "state"
+  | "message"
+  | "claim"
+  | "release"
+  | "presence";
 
 export interface PeerEvent {
   /** Monotonic cursor. Pass the highest seen back as `since` to avoid gaps. */
@@ -43,6 +48,20 @@ export interface PeerEvent {
   holder?: string;
   /** Message body, truncated. */
   text?: string;
+  /**
+   * Sender's public key, for `message`.
+   *
+   * Needed to answer: `reply_to_peer` addresses the response back to exactly the
+   * peer that asked, and a fingerprint is too short to route on.
+   */
+  from?: string;
+  /** Correlation id, so a reply can be tied to its question. */
+  corr?: string;
+  /** Whether the peer expects an answer. */
+  intent?: "tell" | "ask" | "reply";
+  /** Role and status, for `presence`. */
+  role?: string;
+  status?: string;
 }
 
 export type EventListener = (event: PeerEvent) => void;

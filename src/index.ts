@@ -20,9 +20,12 @@ import {
   getDaemonErrorLogPath,
   readConfig,
   resolveAuthMode,
+  resolveRequireSignatures,
 } from "./config.js";
 import { loadOrCreateIdentity } from "./identity.js";
+import { OpSigner } from "./signing.js";
 import { createAllowlist } from "./allowlist.js";
+import { sanitizeLabel } from "./peer-key.js";
 import { ContextStore } from "./store.js";
 import { MarkdownLog } from "./markdown-log.js";
 import { P2PNode, describePeer, type PeerIdentity } from "./p2p.js";
@@ -168,7 +171,26 @@ async function main(): Promise<void> {
   // write, and stamps are what let concurrent edits merge deterministically.
   const identity = loadOrCreateIdentity();
 
-  const store = new ContextStore(identity.publicKeyHex);
+  // The signing key is the identity key: whatever Noise proves at the transport
+  // is exactly what signs each operation, so an entry stays attributable to its
+  // author after any number of peers relay it. A failure here is not fatal —
+  // unsigned entries still merge correctly, they are just not independently
+  // verifiable — so it degrades with a warning rather than refusing to start.
+  let signer: OpSigner | undefined;
+  try {
+    signer = new OpSigner(
+      identity.keyPair.secretKey.subarray(0, 32),
+      identity.publicKeyHex,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[p2pa] could not build a signing key (${message}) — writes will be ` +
+        `unsigned and cannot be verified by peers after a relay`,
+    );
+  }
+
+  const store = new ContextStore(identity.publicKeyHex, Date.now, signer);
   const log = new MarkdownLog(options.contextFile);
   const contention = new ContentionLog();
   const events = new EventBus();
@@ -192,6 +214,7 @@ async function main(): Promise<void> {
   }
 
   const { mode: authMode, legacy } = resolveAuthMode(readConfig());
+  const requireSignatures = resolveRequireSignatures(readConfig());
   const allowlist = createAllowlist();
 
   console.error(
@@ -214,6 +237,34 @@ async function main(): Promise<void> {
     );
   }
 
+  if (requireSignatures) {
+    console.error(
+      "[p2pa] signature enforcement ON — relayed operations without a valid " +
+        "signature are refused (protocol v3 peers cannot sync)",
+    );
+  } else if (allowlist.size > 1) {
+    // Only worth raising with three or more nodes: with a single peer there are
+    // no third-party entries to relay, so an unsigned relay proves nothing less
+    // than the transport already does.
+    console.error(
+      `[p2pa] ${allowlist.size} peers paired and signature enforcement is OFF — a ` +
+        "handshake snapshot relays entries its sender did not author, so any one " +
+        "peer can fabricate another's writes. Once every node runs v0.8+, run " +
+        "`p2pa auth require-signatures`.",
+    );
+  }
+
+  // Set by the envelope handler when an inbound op's signature did not verify, and
+  // read by the transport immediately afterwards. A flag rather than a throw: the
+  // rest of the frame still merges correctly, only the connection has to end.
+  //
+  // One flag serves every connection because the handler is synchronous — the
+  // transport calls it and reads the result in the same tick, with no await in
+  // between, so two peers' frames cannot interleave here. If anything on this
+  // path ever becomes async, this has to become per-connection state or it will
+  // start closing the wrong peer's connection.
+  let sawForgery = false;
+
   const p2p = new P2PNode({
     topic: options.topic,
     keyPair: identity.keyPair,
@@ -221,6 +272,10 @@ async function main(): Promise<void> {
     isPeerAllowed: (pubkey) => allowlist.isAllowed(pubkey),
     lookupPeer: (pubkey) => allowlist.lookup(pubkey),
     getActiveState: () => store.export(),
+    // Advertised in `hello`, so two peers already holding the same document skip
+    // the handshake snapshot instead of re-shipping it on every reconnect.
+    getDigest: () => ({ state: store.stateHash(), claims: store.claimsHash() }),
+    label: identity.label,
     onPeerConnect: (peer: PeerIdentity) => {
       if (peer.pubkey === null) return;
       if (authMode !== "strict" || !allowlist.isAllowed(peer.pubkey)) {
@@ -237,8 +292,13 @@ async function main(): Promise<void> {
       outbox.prune(allowlist.keys());
     },
     onPeerMessage: (envelope: PeerEnvelope, peer: PeerIdentity) => {
-      handlePeerEnvelope({ store, log, contention, events, outbox, p2p }, envelope, peer);
+      sawForgery = handlePeerEnvelope(
+        { store, log, contention, events, outbox, p2p, requireSignatures },
+        envelope,
+        peer,
+      );
     },
+    sawForgery: () => sawForgery,
   });
 
   allowlist.onChange(() => {
@@ -327,10 +387,12 @@ function handlePeerEnvelope(
     events: EventBus;
     outbox: Outbox;
     p2p: P2PNode;
+    requireSignatures: boolean;
   },
   envelope: PeerEnvelope,
   peer: PeerIdentity,
-): void {
+  /** Returns true when this frame carried an operation with a forged signature. */
+): boolean {
   const remoteLabel = describePeer(peer);
   const audit: AuditPeer = {
     fingerprint: peer.fingerprint,
@@ -344,7 +406,7 @@ function handlePeerEnvelope(
         `${summary.ignored} already current, ${summary.rejected} refused, ` +
         `state=${services.store.stateHash()}`,
     );
-    return;
+    return summary.forged > 0;
   }
 
   if (envelope.type === "update") {
@@ -365,7 +427,7 @@ function handlePeerEnvelope(
       `[p2pa] peer update from ${remoteLabel}: ${summary.applied} applied, ` +
         `${summary.contended} contended, state=${services.store.stateHash()}`,
     );
-    return;
+    return summary.forged > 0;
   }
 
   if (envelope.type === "ack") {
@@ -373,21 +435,35 @@ function handlePeerEnvelope(
     if (acked > 0) {
       console.error(`[p2pa:outbox] ${remoteLabel} confirmed ${acked} message(s)`);
     }
-    return;
+    return false;
   }
 
-  const { duplicate } = receiveMessage(
-    services,
-    envelope.text,
-    envelope.id,
-    audit,
-    peer.pubkey,
-  );
-  console.error(
-    duplicate
-      ? `[p2pa] ignoring replayed message from ${remoteLabel}`
-      : `[p2pa] peer message from ${remoteLabel} (${envelope.text.length} chars)`,
-  );
+  if (envelope.type === "message") {
+    const { duplicate } = receiveMessage(
+      services,
+      envelope.text,
+      envelope.id,
+      audit,
+      peer.pubkey,
+      {
+        ...(envelope.corr !== undefined ? { corr: envelope.corr } : {}),
+        ...(envelope.intent !== undefined ? { intent: envelope.intent } : {}),
+      },
+    );
+    console.error(
+      duplicate
+        ? `[p2pa] ignoring replayed message from ${remoteLabel}`
+        : `[p2pa] peer ${envelope.intent ?? "message"} from ${remoteLabel} ` +
+            `(${envelope.text.length} chars` +
+            // Peer-chosen string: sanitized so it cannot forge a log line.
+            `${envelope.corr !== undefined ? `, corr=${sanitizeLabel(envelope.corr)}` : ""})`,
+    );
+    return false;
+  }
+
+  // `hello` and `bye` are settled inside the transport, which owns the
+  // connection lifecycle; nothing above it needs to see them.
+  return false;
 }
 
 main().catch((err: unknown) => {

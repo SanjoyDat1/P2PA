@@ -19,6 +19,8 @@
  * document or tombstone set is a remote memory-exhaustion primitive.
  */
 import { createHash } from "node:crypto";
+import { canonicalJson } from "./canonical.js";
+import { isSigned, stripSignature, verifyOp, type OpSigner } from "./signing.js";
 import {
   breakTie,
   compareHlc,
@@ -61,7 +63,20 @@ export const MAX_VALUE_BYTES = 64 * 1024;
  */
 export const TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-export interface LwwEntry {
+/**
+ * Signature metadata carried by every entry kind.
+ *
+ * Stored with the entry rather than on the envelope so it survives relay: an op
+ * authored by C stays verifiable after B passes it to A. See `signing.ts`.
+ */
+export interface SignatureFields {
+  /** Author's ed25519 public key, lowercase hex. Absent on unsigned entries. */
+  by?: string;
+  /** Base64 signature over the canonical op encoding. */
+  sig?: string;
+}
+
+export interface LwwEntry extends SignatureFields {
   kind: "lww";
   hlc: Hlc;
   /** Omitted when `deleted` is true. */
@@ -69,7 +84,7 @@ export interface LwwEntry {
   deleted?: boolean;
 }
 
-export interface OrSetEntry {
+export interface OrSetEntry extends SignatureFields {
   kind: "orset";
   hlc: Hlc;
   /**
@@ -122,7 +137,14 @@ function isClaim(entry: CrdtEntry): entry is ClaimEntry {
 function entryWins(candidate: CrdtEntry, current: CrdtEntry): boolean {
   const byStamp = compareHlc(candidate.hlc, current.hlc);
   if (byStamp !== 0) return byStamp > 0;
-  return breakTie(canonicalEntry(candidate), canonicalEntry(current)) > 0;
+  const byContent = breakTie(canonicalEntry(candidate), canonicalEntry(current));
+  if (byContent !== 0) return byContent > 0;
+  // Same stamp, same content: keep whichever copy carries a signature. A v3 peer
+  // drops the signature fields when it relays, so one logical write can arrive
+  // both signed and bare; retaining the verifiable copy is strictly more
+  // information and is the same decision on every replica. `canonicalEntry`
+  // deliberately excludes `by`/`sig`, so this is the only place they matter.
+  return isSigned(candidate) && !isSigned(current);
 }
 
 /** Highest lww stamp either side has seen for this key. Monotone, so it converges. */
@@ -134,11 +156,19 @@ function highestFloor(a: CrdtEntry, b: CrdtEntry): Hlc | undefined {
   return compareHlc(left, right) >= 0 ? left : right;
 }
 
-/** Record that a key was an lww register as recently as `stamp`. */
+/**
+ * Record that a key was an lww register as recently as `stamp`.
+ *
+ * Raising the floor edits the entry, so the author's signature no longer covers
+ * it and has to go: relaying a signature over content that has since changed
+ * would have every peer reject the op as a forgery and stall convergence on that
+ * key. The floor is derived state — any replica recomputes it from the ops it has
+ * seen — so losing verifiability here costs nothing.
+ */
 function raiseFloor(entry: CrdtEntry, stamp: Hlc): CrdtEntry {
   if (!isOrSet(entry)) return entry;
   if (entry.floor && compareHlc(entry.floor, stamp) >= 0) return entry;
-  return { ...entry, floor: stamp };
+  return { ...stripSignature(entry), floor: stamp } as OrSetEntry;
 }
 
 /**
@@ -152,14 +182,22 @@ function mergeAdds(
   current: Record<string, JsonValue>,
   incoming: Record<string, JsonValue>,
 ): Record<string, JsonValue> {
-  const out: Record<string, JsonValue> = { ...current };
+  // Prototype-free, because tags come from peers. On a plain object the tag
+  // `__proto__` makes `tag in out` true via the inherited accessor, so a genuine
+  // element was compared against `Object.prototype` and silently dropped — and
+  // assigning to it rewrote the object's prototype instead of adding an element.
+  // Whether that happened depended on how the map was built (`JSON.parse` creates
+  // an own `__proto__`, a spread does not), so two replicas could disagree.
+  // Reserved tags are also refused at the schema boundary; this is the second layer.
+  const out: Record<string, JsonValue> = Object.create(null) as Record<string, JsonValue>;
+  for (const [tag, value] of Object.entries(current)) out[tag] = value;
   for (const [tag, value] of Object.entries(incoming)) {
-    if (!(tag in out)) {
+    if (!Object.hasOwn(out, tag)) {
       out[tag] = value;
       continue;
     }
-    const mine = canonicalize(out[tag] as JsonValue);
-    const theirs = canonicalize(value);
+    const mine = canonicalJson(out[tag] as JsonValue);
+    const theirs = canonicalJson(value);
     if (breakTie(theirs, mine) > 0) out[tag] = value;
   }
   return out;
@@ -170,28 +208,46 @@ function canonicalEntry(entry: CrdtEntry): string {
     return `claim:${entry.gen}:${entry.ttl}:${entry.released === true ? "r" : "a"}`;
   }
   return isOrSet(entry)
-    ? `orset:${canonicalize(entry.adds as JsonValue)}:${[...entry.removes].sort().join(",")}`
-    : `lww:${entry.deleted === true ? "-" : canonicalize((entry.value ?? null) as JsonValue)}`;
-}
-
-/** Deterministic JSON, so every replica hashes an identical document. */
-function canonicalize(value: JsonValue): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalize(item)).join(",")}]`;
-  }
-  const keys = Object.keys(value).sort();
-  const body = keys
-    .map((key) => `${JSON.stringify(key)}:${canonicalize(value[key] as JsonValue)}`)
-    .join(",");
-  return `{${body}}`;
+    ? `orset:${canonicalJson(entry.adds as JsonValue)}:${[...entry.removes].sort().join(",")}`
+    : `lww:${entry.deleted === true ? "-" : canonicalJson((entry.value ?? null) as JsonValue)}`;
 }
 
 export class CrdtDoc {
   private readonly entries = new Map<string, CrdtEntry>();
   private tagCounter = 0;
 
-  constructor(private readonly clock: HybridClock) {}
+  /**
+   * @param signer Signs every entry this replica mints, so the copy kept locally
+   *   and the copy broadcast are byte-identical. Signing only the outbound copy
+   *   would leave this node relaying its own writes unsigned inside snapshots,
+   *   which is exactly the case signatures exist to cover. Omitted in tests and
+   *   on builds without an identity, where entries stay unsigned.
+   */
+  constructor(
+    private readonly clock: HybridClock,
+    private readonly signer?: OpSigner,
+  ) {}
+
+  /**
+   * Attach this node's signature to a freshly minted op.
+   *
+   * A merged OR-set is deliberately left unsigned by `mergeOp`: its contents come
+   * from several authors, so no single signature can speak for it. Delta ops are
+   * signed, which is what makes set *membership* verifiable even though a merged
+   * set is not attributable to one node. See SPEC.md §Signatures.
+   */
+  private signed(op: CrdtOp): CrdtOp {
+    if (!this.signer) return op;
+    try {
+      return this.signer.signOp(op);
+    } catch (err) {
+      // Never fail a local write because signing failed — an unsigned entry is
+      // still correct, merely unverifiable by a third party downstream.
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[p2pa:crdt] could not sign ${op.key}: ${message}`);
+      return op;
+    }
+  }
 
   get nodeId(): string {
     return this.clock.id;
@@ -257,20 +313,26 @@ export class CrdtDoc {
         throw new Error(`document is at its ${MAX_CRDT_KEYS}-key limit`);
       }
     }
-    const entry: LwwEntry = { kind: "lww", hlc: this.clock.tick(), value };
-    this.entries.set(key, entry);
-    return { key, entry };
+    const op = this.signed({
+      key,
+      entry: { kind: "lww", hlc: this.clock.tick(), value } satisfies LwwEntry,
+    });
+    this.entries.set(key, op.entry);
+    return op;
   }
 
   /** Tombstone a key locally. Returns the op to broadcast. */
   deleteValue(key: string): CrdtOp {
-    const entry: LwwEntry = {
-      kind: "lww",
-      hlc: this.clock.tick(),
-      deleted: true,
-    };
-    this.entries.set(key, entry);
-    return { key, entry };
+    const op = this.signed({
+      key,
+      entry: {
+        kind: "lww",
+        hlc: this.clock.tick(),
+        deleted: true,
+      } satisfies LwwEntry,
+    });
+    this.entries.set(key, op.entry);
+    return op;
   }
 
   /** Add one element to a set-valued key. Concurrent adds all survive. */
@@ -297,18 +359,30 @@ export class CrdtDoc {
     }
 
     const tag = this.mintTag(stamp);
-    const entry: OrSetEntry = {
-      kind: "orset",
-      hlc: stamp,
-      adds: { ...base.adds, [tag]: value },
-      removes: [...base.removes],
-    };
-    this.entries.set(key, entry);
-    // Broadcast only the delta; merge is a union so peers converge either way.
-    return {
+    // The stored entry and the broadcast delta are different values, so each is
+    // signed over its own content — a signature covering one would not verify
+    // against the other.
+    const full = this.signed({
       key,
-      entry: { kind: "orset", hlc: stamp, adds: { [tag]: value }, removes: [] },
-    };
+      entry: {
+        kind: "orset",
+        hlc: stamp,
+        adds: { ...base.adds, [tag]: value },
+        removes: [...base.removes],
+        ...(base.floor ? { floor: base.floor } : {}),
+      } satisfies OrSetEntry,
+    });
+    this.entries.set(key, full.entry);
+    // Broadcast only the delta; merge is a union so peers converge either way.
+    return this.signed({
+      key,
+      entry: {
+        kind: "orset",
+        hlc: stamp,
+        adds: { [tag]: value },
+        removes: [],
+      } satisfies OrSetEntry,
+    });
   }
 
   /** Remove every current copy of `value` from a set-valued key. */
@@ -316,24 +390,33 @@ export class CrdtDoc {
     const existing = this.entries.get(key);
     if (!existing || !isOrSet(existing)) return null;
 
-    const target = canonicalize(value);
+    const target = canonicalJson(value);
     const doomed = Object.keys(existing.adds).filter(
-      (tag) => canonicalize(existing.adds[tag] as JsonValue) === target,
+      (tag) => canonicalJson(existing.adds[tag] as JsonValue) === target,
     );
     if (doomed.length === 0) return null;
 
     const stamp = this.clock.tick();
-    const entry: OrSetEntry = {
-      kind: "orset",
-      hlc: stamp,
-      adds: { ...existing.adds },
-      removes: [...new Set([...existing.removes, ...doomed])],
-    };
-    this.entries.set(key, entry);
-    return {
+    const full = this.signed({
       key,
-      entry: { kind: "orset", hlc: stamp, adds: {}, removes: doomed },
-    };
+      entry: {
+        kind: "orset",
+        hlc: stamp,
+        adds: { ...existing.adds },
+        removes: [...new Set([...existing.removes, ...doomed])],
+        ...(existing.floor ? { floor: existing.floor } : {}),
+      } satisfies OrSetEntry,
+    });
+    this.entries.set(key, full.entry);
+    return this.signed({
+      key,
+      entry: {
+        kind: "orset",
+        hlc: stamp,
+        adds: {},
+        removes: doomed,
+      } satisfies OrSetEntry,
+    });
   }
 
   /** Read the lease on a task key, if any. */
@@ -370,8 +453,9 @@ export class CrdtDoc {
     // Refuse to record a lease the merge rule would discard: storing one would
     // tell this node's agent it holds work every peer says it does not.
     if (current && !claimWins(entry, current)) return null;
-    this.entries.set(key, entry);
-    return { key, entry };
+    const op = this.signed({ key, entry });
+    this.entries.set(key, op.entry);
+    return op;
   }
 
   /** End the current generation of a lease. Absorbing, so it cannot be undone. */
@@ -389,8 +473,9 @@ export class CrdtDoc {
       released: true,
       ...(current.note !== undefined ? { note: current.note } : {}),
     };
-    this.entries.set(key, entry);
-    return { key, entry };
+    const op = this.signed({ key, entry });
+    this.entries.set(key, op.entry);
+    return op;
   }
 
   // ---- merge --------------------------------------------------------------
@@ -405,6 +490,9 @@ export class CrdtDoc {
   mergeOp(op: CrdtOp, now: number): MergeResult {
     const { key, entry } = op;
 
+    // Every free check runs before the signature. Verification is ~80µs of
+    // blocking Ed25519 work, so an op that fails a comparison must never be
+    // allowed to buy that work first.
     if (!isAcceptableHlc(entry.hlc, now)) {
       return { key, status: "rejected", reason: "stamp out of bounds" };
     }
@@ -427,6 +515,14 @@ export class CrdtDoc {
     }
     if (JSON.stringify(entry).length > MAX_VALUE_BYTES) {
       return { key, status: "rejected", reason: "entry exceeds value size limit" };
+    }
+    // A signature that does not verify is an active forgery attempt, not a peer
+    // on an older build — those simply arrive unsigned. Checked before the local
+    // clock observes the stamp, so a forged op cannot drag our clock forward on
+    // its way to being refused.
+    const signature = verifyOp(op);
+    if (signature.status === "invalid") {
+      return { key, status: "rejected", reason: `bad signature: ${signature.reason}` };
     }
     if (!this.entries.has(key)) {
       this.collectTombstones(now);
@@ -466,11 +562,19 @@ export class CrdtDoc {
     // the outcome depends on which op happened to arrive first.
     if (isOrSet(entry) !== isOrSet(current)) {
       if (!entryWins(entry, current)) {
-        // The losing side still raises the floor, so a later replica that sees
-        // these ops in another order discards the same stale set ops we did.
-        if (!isOrSet(current) && isOrSet(entry)) {
-          this.entries.set(key, raiseFloor(entry, current.hlc));
-        } else if (isOrSet(current) && !isOrSet(entry)) {
+        // The loser is discarded. Storing it here — which this did when a stale
+        // `orset` lost to a live `lww` — silently replaced the register's value
+        // with the set, reported the merge as "ignored" so nothing reached the
+        // audit trail, and left the two replicas permanently divergent, since
+        // feeding the same two ops in the other order kept the register. One
+        // stale op from any allowlisted peer was enough to erase a key.
+        //
+        // Only the surviving `orset` takes a floor, and only when the loser is an
+        // `lww`: that is real evidence the key was a register at that stamp, and
+        // recording it keeps later stale set ops out. In the reverse case the
+        // winning `lww`'s own stamp already serves as the floor via
+        // `highestFloor`, so there is nothing to store.
+        if (isOrSet(current) && !isOrSet(entry)) {
           this.entries.set(key, raiseFloor(current, entry.hlc));
         }
         return { key, status: "ignored" };
@@ -559,6 +663,11 @@ export class CrdtDoc {
     if (removes.length > MAX_SET_TOMBSTONES) {
       removes = [...removes].sort().slice(0, MAX_SET_TOMBSTONES);
     }
+    // Truncation rewrites the content, so any signature on it is no longer valid
+    // — drop it rather than relay bytes that will not verify.
+    if (adds !== entry.adds || removes !== entry.removes) {
+      return { ...stripSignature(entry), adds, removes } as OrSetEntry;
+    }
     return { ...entry, adds, removes };
   }
 
@@ -621,6 +730,9 @@ export class CrdtDoc {
     ];
     for (const op of ordered) {
       if (!isAcceptableHlc(op.entry.hlc, now)) continue;
+      // The replica file is treated as untrusted input, so a signature edited
+      // into it by hand must not be re-relayed to peers as authentic.
+      if (verifyOp(op).status === "invalid") continue;
       if (isClaim(op.entry)) {
         if (this.claimKeyCount() >= MAX_CLAIM_KEYS) continue;
       } else if (this.liveKeyCount() >= MAX_CRDT_KEYS) {
@@ -647,7 +759,7 @@ export class CrdtDoc {
 
   stateHash(): string {
     return createHash("sha256")
-      .update(canonicalize(this.materialize() as unknown as JsonValue))
+      .update(canonicalJson(this.materialize() as unknown as JsonValue))
       .digest("hex")
       .slice(0, 16);
   }

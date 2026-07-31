@@ -62,6 +62,21 @@ export interface OutboxMessage {
    * conversation it was never party to.
    */
   recipients?: string[];
+  /**
+   * Correlation id and intent, preserved so a queued question is still a question
+   * when it is finally delivered.
+   *
+   * Queuing only the text made the offline path quietly lossy: a message sent by
+   * `ask_peer` was replayed as an ordinary broadcast, so the recipient could not
+   * tell it had been asked anything, could not reply with a matching id, and the
+   * asker waited on a correlation that would never come back. Being deliverable
+   * later is the entire promise of the outbox, so it has to carry what makes the
+   * message answerable.
+   */
+  corr?: string;
+  intent?: "tell" | "ask" | "reply";
+  /** The single addressee, when the message was directed rather than broadcast. */
+  to?: string;
 }
 
 const OutboxFileSchema = z.object({
@@ -74,6 +89,9 @@ const OutboxFileSchema = z.object({
         createdAt: z.string().min(1).max(64),
         ackedBy: z.array(z.string().min(1).max(64)).max(64),
         recipients: z.array(z.string().min(1).max(64)).max(64).optional(),
+        corr: z.string().min(1).max(64).optional(),
+        intent: z.enum(["tell", "ask", "reply"]).optional(),
+        to: z.string().min(1).max(64).optional(),
       }),
     )
     .max(MAX_OUTBOX_MESSAGES),
@@ -108,13 +126,20 @@ export class Outbox {
   }
 
   /** Queue a message for every peer, then let the caller try to send it now. */
-  enqueue(text: string, recipients: string[] = []): OutboxMessage {
+  enqueue(
+    text: string,
+    recipients: string[] = [],
+    addressing: { corr?: string; intent?: "tell" | "ask" | "reply"; to?: string } = {},
+  ): OutboxMessage {
     const message: OutboxMessage = {
       id: randomUUID(),
       text,
       createdAt: new Date().toISOString(),
       ackedBy: [],
       ...(recipients.length > 0 ? { recipients: recipients.slice(0, 64) } : {}),
+      ...(addressing.corr !== undefined ? { corr: addressing.corr } : {}),
+      ...(addressing.intent !== undefined ? { intent: addressing.intent } : {}),
+      ...(addressing.to !== undefined ? { to: addressing.to } : {}),
     };
     this.messages.push(message);
     while (this.messages.length > MAX_OUTBOX_MESSAGES) {

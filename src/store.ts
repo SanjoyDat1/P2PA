@@ -13,6 +13,16 @@ import {
   type ClaimView,
 } from "./claim.js";
 import { HybridClock, nodeIdFromPublicKey, type Hlc } from "./hlc.js";
+import type { OpSigner } from "./signing.js";
+import {
+  agentKeyFor,
+  describeCard,
+  isAgentKey,
+  nodeIdFromAgentKey,
+  parseCard,
+  type AgentCard,
+  type AgentView,
+} from "./presence.js";
 import {
   CrdtOpArraySchema,
   LEGACY_VERSION_KEY,
@@ -38,14 +48,23 @@ export class ContextStore {
    */
   private readonly now: () => number;
 
-  constructor(nodeId?: string, now: () => number = Date.now) {
+  /**
+   * @param signer Signs entries this replica authors, so its writes stay
+   *   verifiable after another peer relays them. Omitted leaves entries unsigned,
+   *   which is still correct — just not independently attributable.
+   */
+  constructor(
+    nodeId?: string,
+    now: () => number = Date.now,
+    signer?: OpSigner,
+  ) {
     const id = nodeId
       ? nodeIdFromPublicKey(nodeId)
       : `anon${Math.random().toString(16).slice(2, 14)}`;
     // Held so lease expiry reads the same clock that stamps writes. Mixing an
     // injected stamp clock with real wall time made lease decisions incoherent.
     this.now = now;
-    this.doc = new CrdtDoc(new HybridClock(id, now));
+    this.doc = new CrdtDoc(new HybridClock(id, now), signer);
   }
 
   /** Current time on this replica's clock, for callers deriving lease views. */
@@ -199,6 +218,61 @@ export class ContextStore {
     return this.doc.export();
   }
 
+  // ---- presence -----------------------------------------------------------
+
+  /**
+   * Publish this node's presence card.
+   *
+   * The key is derived from this replica's own node id rather than taken as an
+   * argument, so there is no call shape that writes somebody else's card.
+   */
+  announce(card: AgentCard): CrdtOp {
+    return this.doc.setValue(
+      agentKeyFor(this.nodeId),
+      card as unknown as JsonValue,
+    );
+  }
+
+  /** This node's own card, if it has announced. */
+  ownCard(): AgentCard | null {
+    return parseCard(this.doc.get(agentKeyFor(this.nodeId)));
+  }
+
+  /**
+   * The roster.
+   *
+   * Cards whose key and stamp disagree are skipped rather than reported: they
+   * cannot arrive over the wire (validation refuses them) but a hand-edited
+   * replica file could carry one, and a roster is the wrong place to surface it.
+   */
+  listAgents(now: number = this.now()): AgentView[] {
+    // Latest wall time each node has stamped anywhere in the document. A node
+    // that is writing state or taking leases is proving it is alive without
+    // having to also remember a heartbeat.
+    const lastActivity = new Map<string, number>();
+    for (const op of this.doc.export()) {
+      const { n, w } = op.entry.hlc;
+      const seen = lastActivity.get(n);
+      if (seen === undefined || w > seen) lastActivity.set(n, w);
+    }
+
+    const out: AgentView[] = [];
+    for (const [key, value] of Object.entries(this.doc.materialize())) {
+      const nodeId = nodeIdFromAgentKey(key);
+      if (nodeId === null) continue;
+      const stamp = this.doc.stampFor(key);
+      if (!stamp || stamp.n !== nodeId) continue;
+      const card = parseCard(value);
+      if (!card) continue;
+      out.push(
+        describeCard(nodeId, card, now, this.nodeId, lastActivity.get(nodeId)),
+      );
+    }
+    return out.sort(
+      (a, b) => Number(b.live) - Number(a.live) || (a.nodeId < b.nodeId ? -1 : 1),
+    );
+  }
+
   /**
    * Replace all entries when rehydrating from disk.
    *
@@ -229,6 +303,8 @@ export class ContextStore {
     for (const [key, value] of Object.entries(state)) {
       if (isReservedKey(key) || key === LEGACY_VERSION_KEY) continue;
       if (isClaimKey(key)) continue;
+      // Re-stamping somebody else's card under this node's id would forge it.
+      if (isAgentKey(key)) continue;
       this.doc.setValue(key, value);
       seeded += 1;
     }
@@ -242,6 +318,11 @@ export class ContextStore {
     if (isClaimKey(key)) {
       throw new Error(
         `Key "${key}" belongs to the lease namespace; use claim/release instead`,
+      );
+    }
+    if (isAgentKey(key)) {
+      throw new Error(
+        `Key "${key}" belongs to the agent-presence namespace; use announce instead`,
       );
     }
     if (key === LEGACY_VERSION_KEY) {

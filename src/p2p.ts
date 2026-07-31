@@ -3,14 +3,133 @@ import type { Duplex } from "node:stream";
 import Hyperswarm, { type HyperswarmDiscovery } from "hyperswarm";
 import type { AuthMode } from "./config.js";
 import type { KeyPair } from "./identity.js";
-import { shortFingerprint } from "./peer-key.js";
+import { sanitizeLabel, shortFingerprint } from "./peer-key.js";
+import {
+  CAP_ADDRESSED_MESSAGES,
+  CAP_CHUNKED_SNAPSHOT,
+  LOCAL_PROFILE,
+  MIN_PROTOCOL_VERSION,
+  PROTOCOL_VERSION,
+  digestsMatch,
+  legacyNegotiation,
+  negotiate,
+  type CloseReason,
+  type Negotiation,
+  type StateDigest,
+} from "./protocol.js";
 import {
   MAX_PAYLOAD_BYTES,
-  PROTOCOL_VERSION,
+  MAX_SNAPSHOT_PARTS,
   PeerEnvelopeSchema,
   type PeerEnvelope,
 } from "./types.js";
-import type { CrdtOp } from "./crdt.js";
+import { MAX_CLAIM_KEYS, MAX_CRDT_KEYS, type CrdtOp } from "./crdt.js";
+import { nodeIdFromPublicKey } from "./hlc.js";
+
+/**
+ * Bytes of serialized ops packed into one snapshot part.
+ *
+ * Half the frame ceiling, so the envelope wrapper and JSON escaping cannot push
+ * a part over the limit the receiver enforces.
+ */
+export const SNAPSHOT_PART_BUDGET = 512 * 1024;
+
+/**
+ * Ops accepted across a whole inbound snapshot.
+ *
+ * There is no point receiving more entries than the document can hold, so this
+ * is the natural bound: a peer cannot use a chunked transfer to stream forever.
+ */
+export const SNAPSHOT_MAX_TOTAL_OPS = MAX_CRDT_KEYS + MAX_CLAIM_KEYS;
+
+/** How long to wait for a peer's hello before assuming it is a v3 node. */
+export const HELLO_TIMEOUT_MS = 5_000;
+
+/**
+ * How long the handshake snapshot window stays open.
+ *
+ * A snapshot is the only frame carrying stamps its sender did not author, so the
+ * window has to close on a clock rather than on the sender's cooperation — a peer
+ * that promises 512 parts and sends one must not keep relay rights indefinitely.
+ * Generous enough for a large chunked transfer over a slow link.
+ */
+export const SNAPSHOT_WINDOW_MS = 120_000;
+
+/**
+ * Outbound bytes buffered for a peer that is not reading.
+ *
+ * `conn.write()` returning false means the kernel buffer is full; ignoring it
+ * (as this did) lets a fast writer grow memory without limit against a peer that
+ * has stopped consuming. Past this the peer is treated as failed rather than
+ * carried indefinitely.
+ */
+export const MAX_OUTBOUND_QUEUE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Inbound envelope rate, as a token bucket.
+ *
+ * Every accepted envelope re-renders `shared_context.md` in full, so a peer
+ * sending small valid frames at link rate amplifies into continuous whole-file
+ * writes. The burst is sized to admit a legitimate chunked snapshot in one go.
+ */
+export const ENVELOPE_BURST = 600;
+export const ENVELOPE_REFILL_PER_SEC = 100;
+
+/** Inbound byte rate. Burst covers a large handshake snapshot. */
+export const BYTE_BURST = 64 * 1024 * 1024;
+export const BYTE_REFILL_PER_SEC = 8 * 1024 * 1024;
+
+/**
+ * Per-connection inbound budget.
+ *
+ * Isolated from the swarm so the policy can be asserted directly, in the same
+ * spirit as `shouldBlockPeer`: a rate limiter that is only reachable through a
+ * live DHT connection is a rate limiter nobody checks.
+ *
+ * Two buckets rather than one. Frames and bytes are independent abuses — a flood
+ * of tiny valid updates is cheap on bandwidth but each one re-renders the whole
+ * Markdown document, while one enormous frame is the reverse.
+ */
+export class RateBudget {
+  private envelopeTokens: number;
+  private byteTokens: number;
+  private lastRefill: number;
+
+  constructor(
+    private readonly envelopeBurst: number = ENVELOPE_BURST,
+    private readonly envelopeRefill: number = ENVELOPE_REFILL_PER_SEC,
+    private readonly byteBurst: number = BYTE_BURST,
+    private readonly byteRefill: number = BYTE_REFILL_PER_SEC,
+    now: number = Date.now(),
+  ) {
+    this.envelopeTokens = envelopeBurst;
+    this.byteTokens = byteBurst;
+    this.lastRefill = now;
+  }
+
+  /**
+   * Charge one frame of `bytes`. False means the peer is over budget.
+   *
+   * Refills before charging, so an idle connection is not penalised for the gap.
+   */
+  admit(bytes: number, now: number = Date.now()): boolean {
+    const elapsed = Math.max(0, now - this.lastRefill) / 1000;
+    this.lastRefill = now;
+    this.envelopeTokens = Math.min(
+      this.envelopeBurst,
+      this.envelopeTokens + elapsed * this.envelopeRefill,
+    );
+    this.byteTokens = Math.min(
+      this.byteBurst,
+      this.byteTokens + elapsed * this.byteRefill,
+    );
+
+    if (this.envelopeTokens < 1 || this.byteTokens < bytes) return false;
+    this.envelopeTokens -= 1;
+    this.byteTokens -= bytes;
+    return true;
+  }
+}
 
 /**
  * Who a message came from. `pubkey` is proven by the Noise handshake — the
@@ -51,6 +170,35 @@ export function shouldBlockPeer(
   return !isPeerAllowed(pubkeyHex);
 }
 
+/**
+ * Split a replica into frames that each fit inside the payload limit.
+ *
+ * Greedy by serialized size. An op larger than the budget still goes out on its
+ * own — `MAX_VALUE_BYTES` already caps a single entry well below the frame
+ * ceiling, so a lone oversized part cannot be constructed from valid entries.
+ */
+export function chunkSnapshot(
+  ops: CrdtOp[],
+  budget: number = SNAPSHOT_PART_BUDGET,
+): CrdtOp[][] {
+  if (ops.length === 0) return [[]];
+  const parts: CrdtOp[][] = [];
+  let current: CrdtOp[] = [];
+  let size = 0;
+  for (const op of ops) {
+    const cost = JSON.stringify(op).length + 1;
+    if (current.length > 0 && size + cost > budget) {
+      parts.push(current);
+      current = [];
+      size = 0;
+    }
+    current.push(op);
+    size += cost;
+  }
+  if (current.length > 0) parts.push(current);
+  return parts;
+}
+
 export interface P2POptions {
   /**
    * Pairing topic. Discovery material, not an access-control boundary — it is
@@ -76,39 +224,86 @@ export interface P2POptions {
   bootstrap?: Array<{ host: string; port: number }>;
   /** Called to obtain the stamped replica state for handshake snapshots. */
   getActiveState: () => CrdtOp[];
+  /**
+   * Current replica digests, advertised in `hello`.
+   *
+   * Two peers whose documents already match skip the snapshot entirely, which is
+   * what stops a reconnect storm from re-shipping the whole document per peer.
+   */
+  getDigest?: () => StateDigest;
+  /** This node's label, shared with peers for display. */
+  label?: string;
   onPeerMessage: PeerMessageHandler;
-  /** Called once a peer is authenticated and connected, for outbox replay. */
+  /** Called once a peer is authenticated, negotiated and connected. */
   onPeerConnect?: (peer: PeerIdentity) => void;
+  /**
+   * Did the frame just handed to `onPeerMessage` contain a forged signature?
+   *
+   * Consulted immediately after each frame. Reported this way rather than thrown
+   * because the rest of the frame still merges correctly — only the connection
+   * needs to end.
+   */
+  sawForgery?: () => boolean;
 }
 
 interface ConnState {
   buffer: string;
-  /** Only the first inbound snapshot per connection is accepted (handshake). */
-  snapshotAccepted: boolean;
   /** Rendered peer label, cached so log lines do not rebuild it per chunk. */
   label: string;
+  /** Settled version + capabilities, or null until the peer identifies itself. */
+  negotiated: Negotiation | null;
+  /** Our snapshot is deferred until negotiation, so it can be shaped correctly. */
+  snapshotSent: boolean;
+  /** Parts of the handshake snapshot accepted so far. */
+  partsAccepted: number;
+  /** Total parts the sender promised, from the first part that named one. */
+  partsExpected: number | null;
+  /** Ops accepted across the whole snapshot, bounded independently of parts. */
+  snapshotOps: number;
+  /** Set once the handshake snapshot is complete; later snapshots are refused. */
+  snapshotComplete: boolean;
+  /** Fires if the peer never sends a hello, so a v3 node still gets served. */
+  helloTimer: NodeJS.Timeout | undefined;
+  /** Frames held while the socket is saturated, in order. */
+  queue: string[];
+  queueBytes: number;
+  drainHooked: boolean;
+  /** True once `write()` reported a full buffer; cleared when it drains. */
+  saturated: boolean;
+  /** Distinct snapshot parts already accepted, so a part cannot be replayed. */
+  partsSeen: Set<number>;
+  /** When the handshake snapshot window closes, whatever the peer has sent. */
+  snapshotDeadline: number;
+  /** Inbound rate budget for this peer. */
+  budget: RateBudget;
 }
 
 /**
- * Hyperswarm P2P transport (Phase 3).
+ * Hyperswarm P2P transport.
+ *
  * - Discovers peers via DHT on sha256(topic)
  * - Frames envelopes as NDJSON (one JSON object per line)
- * - On connect: sends a full Active State snapshot, then diffs/messages
- * - Accepts at most one inbound snapshot per connection (handshake only)
+ * - Opens with `hello`, negotiates version + capabilities, then syncs
+ * - Sends the replica as one or more `snapshot` parts, skipped when digests match
+ * - Refuses to buffer for a peer that has stopped reading, and rate-limits inbound
  */
 export class P2PNode {
   private readonly swarm: Hyperswarm;
   private readonly topic: string;
   private readonly topicFingerprint: string;
   private readonly getActiveState: () => CrdtOp[];
+  private readonly getDigest: (() => StateDigest) | undefined;
+  private readonly label: string | undefined;
   private readonly onPeerMessage: PeerMessageHandler;
   private readonly onPeerConnect: (peer: PeerIdentity) => void;
+  private readonly forgeryReporter: (() => boolean) | undefined;
   private readonly connState = new WeakMap<Duplex, ConnState>();
   private readonly authMode: AuthMode;
   private readonly isPeerAllowed: (pubkeyHex: string) => boolean;
   private readonly lookupPeer: PeerLookup;
   private readonly publicKeyHex: string;
   private blockedCount = 0;
+  private rejectedCount = 0;
   private started = false;
   private discovery: HyperswarmDiscovery | null = null;
 
@@ -119,8 +314,11 @@ export class P2PNode {
       .digest("hex")
       .slice(0, 8);
     this.getActiveState = options.getActiveState;
+    this.getDigest = options.getDigest;
+    this.label = options.label;
     this.onPeerMessage = options.onPeerMessage;
     this.onPeerConnect = options.onPeerConnect ?? (() => {});
+    this.forgeryReporter = options.sawForgery;
     this.authMode = options.authMode;
     // Fail closed: strict mode with no allowlist admits nobody, not everybody.
     this.isPeerAllowed = options.isPeerAllowed ?? (() => false);
@@ -155,6 +353,11 @@ export class P2PNode {
     return this.blockedCount;
   }
 
+  /** Connections dropped after connecting — bad version, rate, or backpressure. */
+  get rejectedConnections(): number {
+    return this.rejectedCount;
+  }
+
   /**
    * The authentication boundary.
    *
@@ -187,7 +390,8 @@ export class P2PNode {
     await this.swarm.flush();
     console.error(
       `[p2p] Looking for peers on topic fingerprint: ${this.topicFingerprint} ` +
-        `(auth=${this.authMode}, me=${shortFingerprint(this.publicKeyHex)})`,
+        `(auth=${this.authMode}, me=${shortFingerprint(this.publicKeyHex)}, ` +
+        `protocol v${MIN_PROTOCOL_VERSION}-v${PROTOCOL_VERSION})`,
     );
   }
 
@@ -211,11 +415,12 @@ export class P2PNode {
     }
   }
 
-  /** Send an envelope to every connected peer as NDJSON. */
+  /** Send an envelope to every negotiated peer as NDJSON. */
   broadcast(envelope: PeerEnvelope): void {
-    const line = encodeNdjsonLine(envelope);
     for (const conn of this.swarm.connections) {
-      writeLine(conn, line);
+      const state = this.connState.get(conn);
+      if (!state || !state.negotiated?.ok) continue;
+      this.writeEnvelope(conn, state, envelope);
     }
   }
 
@@ -226,21 +431,23 @@ export class P2PNode {
    * broadcasting it at everyone who was already up to date.
    */
   sendTo(publicKeyHex: string, envelope: PeerEnvelope): boolean {
-    const line = encodeNdjsonLine(envelope);
     for (const conn of this.swarm.connections) {
       const peer = this.identifyPeer(conn);
-      if (peer.pubkey === publicKeyHex) {
-        writeLine(conn, line);
-        return true;
-      }
+      if (peer.pubkey !== publicKeyHex) continue;
+      const state = this.connState.get(conn);
+      if (!state || !state.negotiated?.ok) return false;
+      this.writeEnvelope(conn, state, envelope);
+      return true;
     }
     return false;
   }
 
-  /** Public keys of every currently connected peer. */
+  /** Public keys of every currently connected, negotiated peer. */
   connectedKeys(): string[] {
     const keys: string[] = [];
     for (const conn of this.swarm.connections) {
+      const state = this.connState.get(conn);
+      if (!state || !state.negotiated?.ok) continue;
       const peer = this.identifyPeer(conn);
       if (peer.pubkey !== null) keys.push(peer.pubkey);
     }
@@ -252,7 +459,33 @@ export class P2PNode {
     return this.swarm.connections.size;
   }
 
+  /** Protocol version settled with a peer, or null when not negotiated. */
+  versionFor(publicKeyHex: string): number | null {
+    for (const conn of this.swarm.connections) {
+      const peer = this.identifyPeer(conn);
+      if (peer.pubkey !== publicKeyHex) continue;
+      const state = this.connState.get(conn);
+      return state?.negotiated?.ok === true ? state.negotiated.version : null;
+    }
+    return null;
+  }
+
+  /** Does the connection to this peer carry a capability? */
+  peerSupports(publicKeyHex: string, cap: string): boolean {
+    for (const conn of this.swarm.connections) {
+      const peer = this.identifyPeer(conn);
+      if (peer.pubkey !== publicKeyHex) continue;
+      const state = this.connState.get(conn);
+      return state?.negotiated?.ok === true && state.negotiated.caps.has(cap);
+    }
+    return false;
+  }
+
   async close(): Promise<void> {
+    for (const conn of this.swarm.connections) {
+      const state = this.connState.get(conn);
+      if (state) this.clearTimers(state);
+    }
     await this.swarm.destroy();
   }
 
@@ -272,8 +505,7 @@ export class P2PNode {
         console.error(
           `[p2p] closing revoked peer ${describePeer(peer)} (removed from allowlist)`,
         );
-        this.connState.delete(conn);
-        conn.destroy();
+        this.closeConnection(conn, "unauthorized", "removed from allowlist");
         closed += 1;
       }
     }
@@ -312,20 +544,25 @@ export class P2PNode {
     }
 
     console.error(`[p2p] Peer connected! (${remoteLabel})`);
-    this.connState.set(conn, {
+    const state: ConnState = {
       buffer: "",
-      snapshotAccepted: false,
       label: remoteLabel,
-    });
-
-    // Handshake: push the stamped replica so the peer converges immediately.
-    // The receiver merges it key by key, so this cannot overwrite their work.
-    const snapshot: PeerEnvelope = {
-      type: "snapshot",
-      v: PROTOCOL_VERSION,
-      ops: this.getActiveState(),
+      negotiated: null,
+      snapshotSent: false,
+      partsAccepted: 0,
+      partsExpected: null,
+      snapshotOps: 0,
+      snapshotComplete: false,
+      helloTimer: undefined,
+      queue: [],
+      queueBytes: 0,
+      drainHooked: false,
+      saturated: false,
+      partsSeen: new Set<number>(),
+      snapshotDeadline: Date.now() + SNAPSHOT_WINDOW_MS,
+      budget: new RateBudget(),
     };
-    writeLine(conn, encodeNdjsonLine(snapshot));
+    this.connState.set(conn, state);
 
     conn.on("data", (chunk: Buffer | Uint8Array | string) => {
       this.onData(conn, peer, chunk);
@@ -336,17 +573,282 @@ export class P2PNode {
     });
 
     conn.on("close", () => {
+      this.clearTimers(state);
       this.connState.delete(conn);
       console.error(`[p2p] Peer disconnected (${remoteLabel})`);
     });
 
-    // Last: after the snapshot so the peer already has current state, and after
-    // the error handler because a replay can push a batch of messages.
+    // Open with our own hello. The peer's reply settles the version, and only
+    // then do we know whether to chunk the snapshot, or skip it entirely.
+    this.writeLine(conn, state, encodeNdjsonLine(this.buildHello()));
+
+    // A v3 peer never sends a hello — it opens with its snapshot. Usually that
+    // arrives at once and identifies it. This covers the peer that says nothing:
+    // without it, waiting for a hello that is never coming would mean neither
+    // side ever sends state.
+    state.helloTimer = setTimeout(() => {
+      if (state.negotiated !== null) return;
+      console.error(
+        `[p2p] no hello from ${remoteLabel} within ${HELLO_TIMEOUT_MS}ms — ` +
+          `treating it as a protocol v${MIN_PROTOCOL_VERSION} peer`,
+      );
+      this.settleNegotiation(conn, state, peer, legacyNegotiation());
+    }, HELLO_TIMEOUT_MS);
+    state.helloTimer.unref?.();
+  }
+
+  private buildHello(): PeerEnvelope {
+    const digest = this.getDigest?.();
+    return {
+      type: "hello",
+      v: PROTOCOL_VERSION,
+      min: LOCAL_PROFILE.min,
+      max: LOCAL_PROFILE.max,
+      node: this.publicKeyHex.slice(0, 16),
+      caps: [...LOCAL_PROFILE.caps],
+      ...(digest ? { digest } : {}),
+      ...(this.label !== undefined ? { label: this.label } : {}),
+    };
+  }
+
+  /**
+   * Record the negotiated version, then send state.
+   *
+   * Everything version-dependent happens here, once, so the rest of the
+   * connection never has to ask what the peer can understand.
+   */
+  private settleNegotiation(
+    conn: Duplex,
+    state: ConnState,
+    peer: PeerIdentity,
+    result: Negotiation,
+    remoteDigest?: StateDigest,
+    remoteLabel?: string,
+  ): void {
+    if (state.helloTimer) {
+      clearTimeout(state.helloTimer);
+      state.helloTimer = undefined;
+    }
+    state.negotiated = result;
+
+    if (!result.ok) {
+      // The whole reason `hello` exists: say why, to both logs, instead of
+      // dropping every frame in silence.
+      console.error(
+        `[p2p] cannot talk to ${state.label}: ${result.detail}`,
+      );
+      this.closeConnection(conn, result.reason, result.detail);
+      return;
+    }
+
+    console.error(
+      `[p2p] negotiated protocol v${result.version} with ${state.label}` +
+        (result.caps.size > 0
+          ? ` (caps: ${[...result.caps].sort().join(",")})`
+          : " (no shared capabilities)") +
+        // Peer-supplied and sanitized. Shown because it is the only human-readable
+        // hint about an unpaired peer, and marked as self-reported because it is a
+        // claim: the fingerprint above is the identity.
+        (remoteLabel !== undefined ? ` — self-reported as "${remoteLabel}"` : ""),
+    );
+
+    this.sendSnapshot(conn, state, remoteDigest);
+
+    // Last: after state has been offered, and after the error handler is
+    // installed, because a replay can push a batch of messages.
     try {
       this.onPeerConnect(peer);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`[p2p] connect handler failed for ${remoteLabel}: ${message}`);
+      console.error(`[p2p] connect handler failed for ${state.label}: ${message}`);
+    }
+  }
+
+  /**
+   * Offer our replica to a freshly negotiated peer.
+   *
+   * Skipped outright when the digests in the two hellos already agree, which is
+   * the common case for a reconnect and turns an O(document) transfer per peer
+   * into nothing at all.
+   */
+  private sendSnapshot(
+    conn: Duplex,
+    state: ConnState,
+    remoteDigest: StateDigest | undefined,
+  ): void {
+    if (state.snapshotSent) return;
+    state.snapshotSent = true;
+
+    const local = this.getDigest?.();
+    if (local && digestsMatch(local, remoteDigest)) {
+      console.error(
+        `[p2p] ${state.label} already holds this document (state=${local.state}) — ` +
+          `skipping the handshake snapshot`,
+      );
+      return;
+    }
+
+    const ops = this.getActiveState();
+    const chunked =
+      state.negotiated?.ok === true && state.negotiated.caps.has(CAP_CHUNKED_SNAPSHOT);
+
+    if (!chunked) {
+      // A v3 peer cannot read `part`/`of`, so there is nothing to split it into.
+      // An oversized document simply cannot reach that peer; say so plainly
+      // rather than shipping a frame it will disconnect over.
+      const line = encodeNdjsonLine({ type: "snapshot", v: MIN_PROTOCOL_VERSION, ops });
+      if (line.length > MAX_PAYLOAD_BYTES) {
+        console.error(
+          `[p2p] cannot send a ${line.length}-byte snapshot to ${state.label}: ` +
+            `it speaks protocol v${MIN_PROTOCOL_VERSION}, which has no chunked ` +
+            `transfer. Upgrade that peer to sync a document this large.`,
+        );
+        return;
+      }
+      this.writeLine(conn, state, line);
+      return;
+    }
+
+    const parts = chunkSnapshot(ops);
+    if (parts.length > MAX_SNAPSHOT_PARTS) {
+      console.error(
+        `[p2p] replica needs ${parts.length} snapshot parts, above the ` +
+          `${MAX_SNAPSHOT_PARTS}-part limit — sending the first ${MAX_SNAPSHOT_PARTS}`,
+      );
+    }
+    const sending = parts.slice(0, MAX_SNAPSHOT_PARTS);
+    sending.forEach((chunk, index) => {
+      this.writeEnvelope(conn, state, {
+        type: "snapshot",
+        v: PROTOCOL_VERSION,
+        ops: chunk,
+        part: index + 1,
+        of: sending.length,
+      });
+    });
+    if (sending.length > 1) {
+      console.error(
+        `[p2p] sent replica to ${state.label} in ${sending.length} parts ` +
+          `(${ops.length} entries)`,
+      );
+    }
+  }
+
+  /**
+   * Write an envelope, shaped for what this connection can understand.
+   *
+   * Version is stamped here rather than by callers: a single broadcast may go to
+   * peers on different versions, and each must receive a frame it accepts.
+   */
+  private writeEnvelope(
+    conn: Duplex,
+    state: ConnState,
+    envelope: PeerEnvelope,
+  ): void {
+    const version =
+      state.negotiated?.ok === true ? state.negotiated.version : MIN_PROTOCOL_VERSION;
+    this.writeLine(conn, state, encodeNdjsonLine(downgrade(envelope, version, state)));
+  }
+
+  /**
+   * Queue a line, respecting backpressure.
+   *
+   * `conn.write()` returning false means the socket buffer is full. Continuing to
+   * write anyway — which is what ignoring the return value does — grows memory
+   * without bound whenever a peer stops reading. Frames are held in order and
+   * flushed on `drain`; a peer that lets the queue pass its ceiling is dropped,
+   * because the alternative is being taken down by it.
+   */
+  private writeLine(conn: Duplex, state: ConnState, line: string): void {
+    if (conn.destroyed) return;
+
+    // Once the socket has signalled "full", everything queues until it drains.
+    // Gating on `queue.length` alone was the bug: the queue only ever grows via
+    // this path, so it stayed empty forever, every later frame went straight into
+    // the socket regardless, and the ceiling below was unreachable — exactly the
+    // unbounded buffering the queue exists to prevent.
+    if (state.saturated || state.queue.length > 0) {
+      this.enqueue(conn, state, line);
+      return;
+    }
+
+    try {
+      if (!conn.write(line)) {
+        state.saturated = true;
+        this.hookDrain(conn, state);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[p2p] write failed to ${state.label}: ${message}`);
+    }
+  }
+
+  private enqueue(conn: Duplex, state: ConnState, line: string): void {
+    state.queue.push(line);
+    state.queueBytes += line.length;
+    if (state.queueBytes > MAX_OUTBOUND_QUEUE_BYTES) {
+      console.error(
+        `[p2p] dropping ${state.label}: ${state.queueBytes} bytes queued and the ` +
+          `peer is not reading (slow consumer)`,
+      );
+      this.closeConnection(conn, "slow-consumer", "outbound queue ceiling reached");
+    }
+  }
+
+  private hookDrain(conn: Duplex, state: ConnState): void {
+    if (state.drainHooked) return;
+    state.drainHooked = true;
+    conn.once("drain", () => {
+      state.drainHooked = false;
+      while (state.queue.length > 0) {
+        if (conn.destroyed) return;
+        const next = state.queue[0] as string;
+        const flushed = conn.write(next);
+        state.queue.shift();
+        state.queueBytes -= next.length;
+        if (!flushed) {
+          this.hookDrain(conn, state);
+          return;
+        }
+      }
+      // Drained with nothing left: writes may go direct again.
+      state.saturated = false;
+    });
+  }
+
+  /** Tell the peer why, then close. */
+  private closeConnection(
+    conn: Duplex,
+    reason: CloseReason,
+    detail?: string,
+  ): void {
+    const state = this.connState.get(conn);
+    if (state) {
+      this.clearTimers(state);
+      try {
+        if (!conn.destroyed) {
+          conn.write(
+            encodeNdjsonLine({
+              type: "bye",
+              v: PROTOCOL_VERSION,
+              reason,
+              ...(detail !== undefined ? { detail: detail.slice(0, 500) } : {}),
+            }),
+          );
+        }
+      } catch {
+        // The peer may already be gone; closing is what matters.
+      }
+      this.connState.delete(conn);
+    }
+    this.rejectedCount += 1;
+    conn.destroy();
+  }
+
+  private clearTimers(state: ConnState): void {
+    if (state.helloTimer) {
+      clearTimeout(state.helloTimer);
+      state.helloTimer = undefined;
     }
   }
 
@@ -363,18 +865,32 @@ export class P2PNode {
     state.buffer += text;
 
     if (state.buffer.length > MAX_PAYLOAD_BYTES * 2) {
-      console.error(
-        `[p2p] destroying ${state.label}: oversized NDJSON buffer`,
-      );
-      this.connState.delete(conn);
-      conn.destroy();
+      console.error(`[p2p] destroying ${state.label}: oversized NDJSON buffer`);
+      this.closeConnection(conn, "oversized", "NDJSON buffer ceiling exceeded");
       return;
     }
 
     let newline: number;
     while ((newline = state.buffer.indexOf("\n")) >= 0) {
-      const line = state.buffer.slice(0, newline).trim();
+      const raw = state.buffer.slice(0, newline);
       state.buffer = state.buffer.slice(newline + 1);
+      if (conn.destroyed) return;
+
+      // Charged on the raw length, including the terminator, and before the line
+      // is inspected. Charging the trimmed length let a peer prepend a megabyte of
+      // spaces for the price of the payload, and skipping empty lines before this
+      // point let an endless stream of newlines through for free — both defeating
+      // the limit outright.
+      if (!state.budget.admit(raw.length + 1)) {
+        console.error(
+          `[p2p] dropping ${state.label}: inbound rate limit exceeded ` +
+            `(> ${ENVELOPE_REFILL_PER_SEC} frames/s or ${BYTE_REFILL_PER_SEC} bytes/s sustained)`,
+        );
+        this.closeConnection(conn, "rate-limit", "inbound rate limit exceeded");
+        return;
+      }
+
+      const line = raw.trim();
       if (line.length === 0) continue;
       this.handleLine(conn, state, line, peer);
     }
@@ -387,11 +903,8 @@ export class P2PNode {
     peer: PeerIdentity,
   ): void {
     if (line.length > MAX_PAYLOAD_BYTES) {
-      console.error(
-        `[p2p] destroying ${state.label}: oversized NDJSON line`,
-      );
-      this.connState.delete(conn);
-      conn.destroy();
+      console.error(`[p2p] destroying ${state.label}: oversized NDJSON line`);
+      this.closeConnection(conn, "oversized", "frame exceeds the payload limit");
       return;
     }
 
@@ -411,11 +924,25 @@ export class P2PNode {
       console.error(
         `[p2p] destroying ${state.label}: envelope validation failed hard (${message})`,
       );
-      this.connState.delete(conn);
-      conn.destroy();
+      this.closeConnection(conn, "malformed", "envelope validation threw");
       return;
     }
     if (!result.success) {
+      // A version outside the supported range is the one invalid envelope worth
+      // explaining, because it is the one an operator can act on.
+      const version = (parsed as { v?: unknown })?.v;
+      if (typeof version === "number" && version > PROTOCOL_VERSION) {
+        console.error(
+          `[p2p] ${state.label} sent a protocol v${version} frame; this node ` +
+            `supports up to v${PROTOCOL_VERSION}. Upgrade this node (\`npm i -g p2pa\`).`,
+        );
+        this.closeConnection(
+          conn,
+          "version-mismatch",
+          `frame version v${version} above supported v${PROTOCOL_VERSION}`,
+        );
+        return;
+      }
       console.error(
         `[p2p] ignoring invalid envelope from ${state.label}: ${result.error.message}`,
       );
@@ -424,15 +951,86 @@ export class P2PNode {
 
     const envelope = result.data;
 
-    // Handshake gate: only the first snapshot on this connection is applied.
-    if (envelope.type === "snapshot") {
-      if (state.snapshotAccepted) {
+    if (envelope.type === "hello") {
+      if (state.negotiated !== null) {
+        console.error(`[p2p] ignoring repeat hello from ${state.label}`);
+        return;
+      }
+      // Cross-check the advertised node id against the key Noise proved. The
+      // transport key is the stronger identity and everything downstream binds to
+      // it, so this cannot be the security boundary — but a mismatch means the
+      // peer is misconfigured or lying, and both are worth refusing here rather
+      // than debugging later through inconsistent stamps.
+      if (
+        peer.pubkey !== null &&
+        envelope.node !== nodeIdFromPublicKey(peer.pubkey)
+      ) {
         console.error(
-          `[p2p] ignoring post-handshake snapshot from ${state.label}`,
+          `[p2p] refusing ${state.label}: hello claims node id ` +
+            `${sanitizeLabel(envelope.node)} but its transport key is ` +
+            `${nodeIdFromPublicKey(peer.pubkey)}`,
+        );
+        this.closeConnection(
+          conn,
+          "malformed",
+          "hello node id does not match the transport key",
         );
         return;
       }
-      state.snapshotAccepted = true;
+      this.settleNegotiation(
+        conn,
+        state,
+        peer,
+        negotiate({
+          min: envelope.min,
+          max: envelope.max,
+          node: envelope.node,
+          caps: envelope.caps,
+          ...(envelope.digest ? { digest: envelope.digest } : {}),
+        }),
+        envelope.digest,
+        envelope.label !== undefined ? sanitizeLabel(envelope.label) : undefined,
+      );
+      return;
+    }
+
+    if (envelope.type === "bye") {
+      // Peer-authored strings. Length-bounded by the schema, but a newline or an
+      // ANSI escape here would let a peer forge log lines or drive the operator's
+      // terminal, so they go through the same sanitizer as an audit entry.
+      console.error(
+        `[p2p] ${state.label} closed the connection: ${sanitizeLabel(envelope.reason)}` +
+          (envelope.detail ? ` — ${sanitizeLabel(envelope.detail)}` : ""),
+      );
+      this.clearTimers(state);
+      this.connState.delete(conn);
+      conn.destroy();
+      return;
+    }
+
+    // Any frame other than a hello identifies a peer that does not negotiate.
+    if (state.negotiated === null) {
+      console.error(
+        `[p2p] ${state.label} opened with ${envelope.type} rather than hello — ` +
+          `treating it as a protocol v${MIN_PROTOCOL_VERSION} peer`,
+      );
+      this.settleNegotiation(conn, state, peer, legacyNegotiation());
+      if (conn.destroyed) return;
+    }
+
+    // Somebody else's mail. Dropped at the transport so it never reaches the
+    // audit trail or the event feed — an agent asked to review a diff should not
+    // have to work out that the question was aimed at a different agent.
+    if (
+      envelope.type === "message" &&
+      envelope.to !== undefined &&
+      envelope.to !== this.publicKeyHex
+    ) {
+      return;
+    }
+
+    if (envelope.type === "snapshot" && !this.admitSnapshot(conn, state, envelope)) {
+      return;
     }
 
     console.error(`[p2p] received ${envelope.type} from ${state.label}`);
@@ -442,24 +1040,139 @@ export class P2PNode {
       // A malformed envelope must cost this peer its connection, not the daemon.
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[p2p] handler threw for ${state.label}: ${message}`);
-      this.connState.delete(conn);
-      conn.destroy();
+      this.closeConnection(conn, "malformed", "handler threw");
+      return;
+    }
+
+    // A forged signature is not a peer being sloppy, and verification is the most
+    // expensive thing an inbound frame can buy. Dropping the connection makes
+    // grinding forgeries cost a reconnect each time instead of being free.
+    if (this.forgeryReporter?.() === true) {
+      console.error(
+        `[p2p] dropping ${state.label}: presented an operation whose signature ` +
+          `does not verify`,
+      );
+      this.closeConnection(conn, "malformed", "operation signature did not verify");
     }
   }
+
+  /**
+   * Gate the handshake snapshot.
+   *
+   * A snapshot is only accepted while the handshake is in progress: it is the one
+   * frame that carries stamps the sender did not author, so allowing one later
+   * would hand a connected peer a way to keep replaying third-party entries. A
+   * chunked transfer is several frames, so the gate counts parts and total ops
+   * rather than admitting exactly one.
+   */
+  private admitSnapshot(
+    conn: Duplex,
+    state: ConnState,
+    envelope: Extract<PeerEnvelope, { type: "snapshot" }>,
+  ): boolean {
+    if (state.snapshotComplete) {
+      console.error(`[p2p] ignoring post-handshake snapshot from ${state.label}`);
+      return false;
+    }
+
+    // A peer that announces 512 parts and sends one would otherwise hold the
+    // window open for the life of the connection, keeping the ability to inject
+    // third-party-stamped entries whenever it liked. The window is the handshake,
+    // so it closes on time regardless of what the peer does or does not send.
+    if (Date.now() > state.snapshotDeadline) {
+      state.snapshotComplete = true;
+      console.error(
+        `[p2p] snapshot window closed for ${state.label} after ` +
+          `${SNAPSHOT_WINDOW_MS}ms (${state.partsAccepted}/${state.partsExpected ?? 1} parts)`,
+      );
+      return false;
+    }
+
+    const of = envelope.of ?? 1;
+    if (state.partsExpected === null) state.partsExpected = of;
+    if (of !== state.partsExpected) {
+      console.error(
+        `[p2p] destroying ${state.label}: snapshot part count changed mid-transfer ` +
+          `(${state.partsExpected} then ${of})`,
+      );
+      this.closeConnection(conn, "malformed", "snapshot part count changed");
+      return false;
+    }
+
+    // Track parts by number rather than only counting them, so the same part
+    // cannot be replayed to spend the op budget repeatedly.
+    const part = envelope.part ?? 1;
+    if (part > of) {
+      console.error(
+        `[p2p] destroying ${state.label}: snapshot part ${part} above the ` +
+          `declared total of ${of}`,
+      );
+      this.closeConnection(conn, "malformed", "snapshot part out of range");
+      return false;
+    }
+    if (state.partsSeen.has(part)) {
+      console.error(`[p2p] ignoring repeated snapshot part ${part} from ${state.label}`);
+      return false;
+    }
+    state.partsSeen.add(part);
+
+    state.partsAccepted += 1;
+    state.snapshotOps += envelope.ops.length;
+
+    if (state.partsAccepted > state.partsExpected) {
+      console.error(`[p2p] ignoring extra snapshot part from ${state.label}`);
+      return false;
+    }
+    if (state.snapshotOps > SNAPSHOT_MAX_TOTAL_OPS) {
+      console.error(
+        `[p2p] destroying ${state.label}: snapshot carried more than ` +
+          `${SNAPSHOT_MAX_TOTAL_OPS} entries`,
+      );
+      this.closeConnection(conn, "oversized", "snapshot exceeds the entry ceiling");
+      return false;
+    }
+
+    // Each part is merged as it arrives — merge is commutative and idempotent, so
+    // there is no reason to buffer a whole transfer before applying any of it, and
+    // a connection lost mid-snapshot leaves the receiver strictly better off.
+    if (state.partsAccepted === state.partsExpected) {
+      state.snapshotComplete = true;
+    }
+    return true;
+  }
+}
+
+/**
+ * Remove fields a peer on an older version cannot read.
+ *
+ * Sending them anyway is not harmless: v3 validates with a fixed shape, so an
+ * unknown field is silently dropped and the sender is left believing it
+ * addressed a message that the receiver treated as a broadcast.
+ */
+function downgrade(
+  envelope: PeerEnvelope,
+  version: number,
+  state: ConnState,
+): PeerEnvelope {
+  if (version >= PROTOCOL_VERSION) return { ...envelope, v: version };
+
+  if (envelope.type === "message") {
+    const addressed =
+      state.negotiated?.ok === true &&
+      state.negotiated.caps.has(CAP_ADDRESSED_MESSAGES);
+    if (addressed) return { ...envelope, v: version };
+    const { to: _to, corr: _corr, intent: _intent, ...rest } = envelope;
+    return { ...rest, v: version };
+  }
+  if (envelope.type === "snapshot") {
+    const { part: _part, of: _of, ...rest } = envelope;
+    return { ...rest, v: version };
+  }
+  return { ...envelope, v: version };
 }
 
 function encodeNdjsonLine(envelope: PeerEnvelope): string {
   return `${JSON.stringify(envelope)}\n`;
-}
-
-function writeLine(conn: Duplex, line: string): void {
-  try {
-    if (conn.destroyed) return;
-    conn.write(line);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[p2p] write failed: ${message}`);
-  }
 }
 
 /** Render a peer for logs: `a3f9c1b2 (sanjoy-laptop)`, or just the fingerprint. */

@@ -27,10 +27,18 @@ Multi-agent collaboration is still broken in three ways:
 - **Key-based peer authentication** — Only allowlisted ed25519 keys can connect. No inbound access from a leaked topic.
 - **Per-key CRDT merge** — Every key carries its own hybrid logical clock. Two agents writing different keys never conflict; two agents writing the same key resolve to the same winner on every replica, with no arbitration step.
 - **Add-wins sets** — Concurrent appends to a list all survive, instead of one agent's entries overwriting the other's.
-- **Work-claiming leases** — An agent claims a task before starting it, so two agents never do the same job. Leases expire on their own, so a crashed agent cannot block the backlog.
+- **Work-claiming leases** — An agent claims a task before starting it, so two connected agents don't duplicate work. Leases expire on their own, so a crashed agent cannot block the backlog.
+- **Agent roster** — Each agent publishes its role, capabilities and status, so a swarm can route work to whoever is actually free instead of guessing.
+- **Addressed messages** — Ask one specific agent a question and match its reply by correlation id, rather than broadcasting at everyone.
+- **Signed operations** — Every write is signed by its author's key, so an entry stays attributable after any number of peers relay it. Without this, a swarm of three lets one peer fabricate another's writes.
+- **Negotiated protocol** — Peers agree a version and capability set on connect, so a mixed-version swarm keeps working and an incompatible one says why instead of silently never syncing.
 - **Event-driven, not polling** — An agent can block until the other one actually does something, instead of hoping it remembers to check.
 - **Messages survive a disconnect** — Write to a peer whose agent is offline and it is delivered when they return. Nobody has to resend.
 - **Human-readable audit log** — Every change lands in `~/.p2pa/shared_context.md`, attributed to the peer that made it.
+
+The wire protocol is specified in **[SPEC.md](./SPEC.md)** — frame grammar, merge
+rules, signature canonicalization, bounds, and conformance vectors — so P2PA can
+be implemented in another language and interoperate.
 
 ---
 
@@ -76,7 +84,7 @@ work-leases do what they claim:
 git clone https://github.com/SanjoyDat1/P2PA.git
 cd P2PA
 npm install
-npm test                 # 228 tests, fully offline
+npm test                 # full suite, fully offline
 
 npm run smoke:merge      # two replicas writing at once, no lost work
 npm run smoke:claim      # two agents racing one backlog, nobody duplicates
@@ -224,6 +232,7 @@ session without any tooling.
 | `p2pa peers` | List allowlisted peers |
 | `p2pa peers remove <pubkey\|label>` | Revoke a peer |
 | `p2pa auth <strict\|open>` | Set the connection policy |
+| `p2pa auth require-signatures` | Refuse relayed operations that are not signed (recommended for 3+ peers) |
 | `p2pa doc create [--title]` | Create a Google Doc war room + anyone-with-link edit |
 | `p2pa doc link <url>` | Bind an existing Google Doc |
 | `p2pa doc unlink` | Clear the doc binding |
@@ -259,7 +268,7 @@ Each install generates a stable ed25519 keypair on first run, derived from a 32-
 
 Hyperswarm's Noise handshake already proves a peer holds the secret key for the public key it presents. P2PA hooks the `firewall` callback — which runs on **both inbound and outbound** connection attempts — and refuses any key that is not on your allowlist. An unauthorized peer is dropped before a single byte of application data is exchanged, so it can neither read your state via the handshake snapshot nor write it via a patch.
 
-> Envelopes are deliberately **not** individually signed. The transport is already authenticated end-to-end to the remote's static key, and P2PA never relays or gossips messages on behalf of a third party, so per-message signatures would add cost without adding a guarantee.
+> That covers each **hop**. It does not cover relay: a handshake snapshot carries operations authored by *other* peers — that is how a joining node learns what everyone else has done — so "the sender proved who it is" says nothing about who wrote the entries inside. With two nodes that costs nothing; with three or more it lets one peer fabricate another's writes. Every operation is therefore signed by its author's key, and stays verifiable however many peers relay it. See [SPEC.md §6](./SPEC.md#6-operation-signatures), and turn on enforcement with `p2pa auth require-signatures` once every node runs 0.8+.
 
 ### Auth modes
 
@@ -367,16 +376,25 @@ Once connected, agents can call:
 
 | Tool | What it does |
 |------|----------------|
-| `send_peer_message` | Message your peers; queued and retried if they are offline |
+| `send_peer_message` | Message every peer; queued and retried if they are offline |
+| `ask_peer` | Ask **one** agent a question, get a correlation id to match the reply |
+| `reply_to_peer` | Answer a question another agent asked you |
 | `await_peer_event` | Block until a peer acts, then return what they did |
 | `recent_peer_events` | Catch up on peer activity without blocking |
 | `outbox_status` | Messages still awaiting confirmation |
+
+**Knowing who is in the swarm**
+
+| Tool | What it does |
+|------|----------------|
+| `announce_self` | Publish your role, capabilities and status so peers can route work to you |
+| `list_agents` | The roster: who is here, what they do, who is free |
 
 **Introspection**
 
 | Tool | What it does |
 |------|----------------|
-| `sync_health` | Replica id, content hash, peer count — equal hashes mean equal state |
+| `sync_health` | Replica id, content hash, peer count, negotiated protocol version per peer |
 | `read_context_history` | Read the last *N* lines of the local markdown log |
 
 **Living doc** (optional, see [below](#living-doc-google-docs-steering))
@@ -470,6 +488,38 @@ ordinary answer.
 Clients that support MCP resource subscriptions can instead watch
 `p2pa://events` and get nudged on each peer action, without parking a tool call.
 
+### Working as a swarm
+
+With more than two agents, "who should do this?" matters as much as "has someone
+already done it?". Each agent publishes a card saying what it is for:
+
+```
+Agent A: announce_self(role="planner",  capabilities=["architecture"])
+Agent B: announce_self(role="builder",  capabilities=["typescript","tests"])
+Agent C: announce_self(role="reviewer", capabilities=["security"])
+```
+
+Any agent can then read the roster and route work:
+
+```
+Agent A: list_agents(capability="typescript", idle_only=true)
+         → [{ nodeId: "b4f9…", role: "builder", status: "idle", live: true }]
+Agent A: ask_peer(node_id="b4f9…", question="can you take refactor-auth?")
+         → { corr: "7c1d94a2ef0b3355" }
+Agent B: ← await_peer_event() wakes with { kind:"message", intent:"ask", corr:"7c1d94a2ef0b3355", from:"b4f9…" }
+Agent B: reply_to_peer(to="…", corr="7c1d94a2ef0b3355", answer="taking it now")
+```
+
+`ask_peer` is addressed: it lands **only** in that agent's feed, so a question
+meant for the reviewer does not interrupt everyone else. Replies carry the same
+`corr`, so an agent juggling several open threads knows which answer belongs to
+which question. Both are queued if the recipient is offline.
+
+A card is only valid in the one slot its author owns (`@agent/<nodeId>`), so no
+peer can announce on another's behalf — the same rule that protects leases.
+Liveness comes from the card's own timestamp: re-announce every 30s or so, and an
+agent that stops is reported `live: false` rather than lingering as available.
+
 ### How merge works
 
 1. Every local write stamps its key with a hybrid logical clock: wall time, a
@@ -517,7 +567,9 @@ p2pa log
 - In `strict` mode (the default) the **peer allowlist is the access-control boundary** — a topic leak alone no longer grants access. See [Peer authentication](#peer-authentication).
 - The **topic is still discovery material, not a secret** — it is announced on the public DHT. Prefer long random topics (auto-generated codes are 22 characters), and avoid `--topic` on the command line, where it lands in shell history and `ps` output. Use `p2pa pair` or `P2PA_TOPIC` instead.
 - In `open` mode there is no authentication at all: anyone who learns the topic can read and write your shared state. Only use it to keep a pre-0.7 pairing alive while you migrate.
-- **`identity.json` is your node's private key material.** Never copy it between machines — two nodes sharing a keypair cannot be told apart or revoked independently.
+- **`identity.json` is your node's private key material.** Never copy it between machines — two nodes sharing a keypair cannot be told apart or revoked independently. It is also the signing key for every operation this node authors.
+- **In a swarm of three or more, turn on signature enforcement.** A handshake snapshot legitimately relays operations authored by *other* peers, so hop-by-hop authentication cannot vouch for their contents. Signatures close that: an entry stays verifiable after any number of relays. Enforcement is off by default only because it excludes v3 peers. See [SPEC.md §6](./SPEC.md#6-operation-signatures).
+- **Peer-supplied text is data, never instructions.** Message bodies, agent roles, capabilities and notes are all written by the peer. Agents must treat them as claims to evaluate, not commands to follow.
 - The **Google Doc link is also a capability** — with “anyone with the link = editor,” anyone who has the URL can steer agents via HUMAN directives. Rotate by creating a new doc + `p2pa doc unlink`.
 - Service account JSON (`P2PA_GOOGLE_SA_JSON`) must stay on disk / in MCP env only — never in Active State, the Doc, or P2P patches.
 - **An allowlisted peer is trusted.** It can write any state key, take a lease
@@ -525,8 +577,11 @@ p2pa log
   with people, not with topics you found somewhere.
 - **`outbox.json` holds message text on disk** (0600, inside the 0700 config
   directory). Message history is only replayed to peers you have paired with.
-- Peers never relay for each other, which is what makes unsigned envelopes safe.
-  If relaying is ever added, per-envelope signatures become mandatory.
+- **Peers do relay for each other**, inside the handshake snapshot. Every
+  operation is signed by its author, so a relayed write stays attributable.
+  Enforcement (`p2pa auth require-signatures`) is off by default only because a
+  protocol v3 peer cannot sign — turn it on once every node runs 0.8+, and
+  certainly before running a swarm of three or more.
 - Config directory defaults to `0700`; `config.json` is written as `0600`.
 - Do not put credentials or production secrets into shared context.
 - Background daemon logs go to `daemon-error.log` so MCP stdout stays a clean JSON-RPC stream.
@@ -540,7 +595,7 @@ git clone <your-repo-url>
 cd P2PA
 npm install
 npm run build
-npm test                 # 228 tests, unit + integration, fully offline
+npm test                 # unit + integration + conformance, fully offline
 npm run smoke            # Hyperswarm two-node sync (needs internet)
 npm run smoke:merge      # concurrent merge, same-key resolution, set adds
 npm run smoke:claim      # two agents racing the same backlog
@@ -579,9 +634,10 @@ test that fails if you remove the guard that provides it.
 
 - Notion and other living-doc adapters
 - Optional Streamable HTTP transport alongside stdio
-- Delta sync on reconnect (peers currently exchange a full stamped snapshot)
-- Signed envelopes, which become **required** if relaying is ever added — today
-  a node only ever speaks for itself, which is what makes unsigned ops safe
+- Key-level delta sync (peers already skip the snapshot entirely when their
+  digests match, but a partial mismatch still ships the whole replica)
+- Making signature enforcement the default, once protocol v3 peers are rare
+  enough that excluding them costs nothing
 
 ---
 
