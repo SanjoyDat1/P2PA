@@ -148,8 +148,13 @@ async function main(): Promise<void> {
     ["A has Active State section", textA.includes("## Active State")],
     ["A has Audit Trail section", textA.includes("## Audit Trail")],
     [
-      "B has Peer State Patch",
-      textB.includes("[SOURCE: Peer]") && textB.includes("[ACTION: State Patch]"),
+      // "State Patch" was the counter protocol's action name and has not been
+      // emitted since the CRDT rewrite, so this check could never pass — it
+      // reported FAIL on every run while the behaviour it describes worked.
+      // The attribution suffix also changed: peer entries now carry the
+      // fingerprint, so `[SOURCE: Peer ...]` no longer ends at `Peer]`.
+      "B recorded a peer state update",
+      textB.includes("[SOURCE: Peer") && textB.includes("[ACTION: State Update]"),
     ],
     [
       "A has Peer Message",

@@ -37,6 +37,7 @@ import {
   removePeer,
   resolveAuthMode,
   setAuthMode,
+  setRequireSignatures,
   setDocLink,
   writeTopicPreservingRest,
   type AuthMode,
@@ -620,6 +621,35 @@ function cmdAuth(mode: AuthMode): void {
   );
 }
 
+/**
+ * Turn signature enforcement on or off.
+ *
+ * Separate from `auth <mode>` because it answers a different question: `auth`
+ * decides who may connect, this decides whether a connected peer's *relayed*
+ * claims about third parties are trusted.
+ */
+function cmdRequireSignatures(required: boolean): void {
+  const config = readConfig();
+  if (!config) {
+    throw new Error(
+      "No pairing topic yet — run `p2pa start --topic …` or `p2pa mcp` once first.",
+    );
+  }
+
+  setRequireSignatures(required);
+  process.stdout.write(
+    required
+      ? `✓ signature enforcement ON — a relayed operation without a valid\n` +
+          `  signature is refused, so no peer can fabricate another peer's writes.\n` +
+          `  Every node must run p2pa 0.8+ (protocol v4); a v3 peer cannot sign and\n` +
+          `  will no longer sync. Running nodes apply this on their next restart.\n`
+      : `✓ signature enforcement OFF — unsigned relayed operations are accepted,\n` +
+          `  which is required for protocol v3 peers. With three or more nodes this\n` +
+          `  lets any one peer fabricate another's writes inside a handshake\n` +
+          `  snapshot. Prefer \`p2pa auth require-signatures\`.\n`,
+  );
+}
+
 async function main(): Promise<void> {
   await yargs(hideBin(process.argv))
     .scriptName("p2pa")
@@ -712,16 +742,28 @@ async function main(): Promise<void> {
     )
     .command(
       "auth <mode>",
-      "Set the connection policy: strict (allowlist only) or open",
+      "Set the connection policy: strict, open, require-signatures, allow-unsigned",
       (y) =>
         y.positional("mode", {
           type: "string",
-          choices: ["strict", "open"] as const,
-          describe: "strict = allowlisted peers only; open = anyone with the topic",
+          choices: [
+            "strict",
+            "open",
+            "require-signatures",
+            "allow-unsigned",
+          ] as const,
+          describe:
+            "strict = allowlisted peers only; open = anyone with the topic; " +
+            "require-signatures = refuse unsigned relayed operations",
           demandOption: true,
         }),
       (argv) => {
-        cmdAuth(String(argv.mode) as AuthMode);
+        const mode = String(argv.mode);
+        if (mode === "require-signatures" || mode === "allow-unsigned") {
+          cmdRequireSignatures(mode === "require-signatures");
+          return;
+        }
+        cmdAuth(mode as AuthMode);
       },
     )
     .command(

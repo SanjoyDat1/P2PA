@@ -1,7 +1,7 @@
 {
   "name": "p2pa",
-  "version": "0.7.0",
-  "description": "P2PA \u2014 headless P2P context synchronization for local AI agents (MCP + Hyperswarm + JSON Patch)",
+  "version": "0.8.0",
+  "description": "P2PA \u2014 headless peer-to-peer context synchronization, work leases, and messaging for local AI agents (MCP + Hyperswarm + per-key CRDT)",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "README.md",
+    "SPEC.md",
     "LICENSE",
     "package.json"
   ],
@@ -19,10 +20,13 @@
     "p2p",
     "hyperswarm",
     "ai-agents",
-    "json-patch",
+    "crdt",
     "cursor",
     "claude",
-    "multi-agent"
+    "multi-agent",
+    "agent-swarm",
+    "agent-communication",
+    "local-first"
   ],
   "scripts": {
     "build": "tsc",

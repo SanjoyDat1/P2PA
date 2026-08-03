@@ -22,6 +22,13 @@ import {
   type ClaimEntry,
   type ClaimView,
 } from "./claim.js";
+import { isSigned } from "./signing.js";
+import {
+  isAgentKey,
+  nodeIdFromAgentKey,
+  parseCard,
+  type AgentCard,
+} from "./presence.js";
 
 export interface SyncServices {
   store: ContextStore;
@@ -32,6 +39,15 @@ export interface SyncServices {
   events?: EventBus;
   /** Holds messages until the recipient confirms them. */
   outbox?: Outbox;
+  /**
+   * Refuse peer operations that carry no signature.
+   *
+   * Off by default because it excludes every v3 peer. On, it closes the one gap
+   * hop-by-hop authentication cannot: a snapshot relays entries the sender did
+   * not author, so without signatures a three-node swarm lets one peer fabricate
+   * another's writes. Worth turning on once every node speaks v4.
+   */
+  requireSignatures?: boolean;
 }
 
 export type ApplyResult =
@@ -44,6 +60,27 @@ export interface InboundSummary {
   contended: number;
   rejected: number;
   rejections: string[];
+  /**
+   * Ops refused because a signature did not verify.
+   *
+   * Counted separately because it means something different from every other
+   * rejection: a bound being hit is a peer misbehaving by degree, a bad signature
+   * is a forgery attempt. The transport uses it to drop the connection, so
+   * grinding forged signatures is not free.
+   */
+  forged: number;
+}
+
+/** A summary with nothing in it, so every construction site stays consistent. */
+function emptySummary(): InboundSummary {
+  return {
+    applied: 0,
+    ignored: 0,
+    contended: 0,
+    rejected: 0,
+    rejections: [],
+    forged: 0,
+  };
 }
 
 /**
@@ -115,9 +152,7 @@ export function handleInboundOps(
     const forged = ops.filter((op) => op?.entry?.hlc?.n !== expected);
     if (forged.length > 0) {
       const summary: InboundSummary = {
-        applied: 0,
-        ignored: 0,
-        contended: 0,
+        ...emptySummary(),
         rejected: forged.length,
         rejections: ["stamp does not match the sending peer's identity"],
       };
@@ -135,9 +170,7 @@ export function handleInboundOps(
   const parsed = CrdtOpArraySchema.safeParse(ops);
   if (!parsed.success) {
     const summary: InboundSummary = {
-      applied: 0,
-      ignored: 0,
-      contended: 0,
+      ...emptySummary(),
       rejected: ops.length,
       rejections: [parsed.error.message],
     };
@@ -172,7 +205,7 @@ export function applyPeerSnapshot(
   peer?: AuditPeer,
 ): InboundSummary {
   if (ops.length === 0) {
-    return { applied: 0, ignored: 0, contended: 0, rejected: 0, rejections: [] };
+    return emptySummary();
   }
 
   // A snapshot legitimately relays stamps authored by third parties, so its
@@ -183,7 +216,17 @@ export function applyPeerSnapshot(
   const impersonating = ops.filter(
     (op) => op?.entry?.hlc?.n === services.store.nodeId,
   );
-  const relayed = ops.filter((op) => op?.entry?.hlc?.n !== services.store.nodeId);
+  let relayed = ops.filter((op) => op?.entry?.hlc?.n !== services.store.nodeId);
+
+  // The relay gap, closed by policy. Sender-binding cannot help here — the whole
+  // point of a snapshot is to carry other nodes' work — so a signature is the
+  // only thing that distinguishes a faithful relay from a fabrication.
+  let unsigned = 0;
+  if (services.requireSignatures === true) {
+    const verifiable = relayed.filter((op) => isSigned(op.entry));
+    unsigned = relayed.length - verifiable.length;
+    relayed = verifiable;
+  }
 
   const appliedKeys: string[] = [];
   const results = services.store.merge(relayed);
@@ -203,6 +246,12 @@ export function applyPeerSnapshot(
       source,
       peer,
       impersonating.map((op) => op?.key ?? "?"),
+    );
+  }
+  if (unsigned > 0) {
+    summary.rejected += unsigned;
+    summary.rejections.push(
+      "relayed entry carries no signature and signatures are required",
     );
   }
   services.log.syncSnapshot(
@@ -232,13 +281,7 @@ function absorb(
   peer: AuditPeer | undefined,
   options: { snapshot?: boolean } = {},
 ): InboundSummary {
-  const summary: InboundSummary = {
-    applied: 0,
-    ignored: 0,
-    contended: 0,
-    rejected: 0,
-    rejections: [],
-  };
+  const summary: InboundSummary = emptySummary();
   const touched: string[] = [];
   const refused: string[] = [];
 
@@ -255,6 +298,10 @@ function absorb(
     if (result.status === "rejected") {
       summary.rejected += 1;
       refused.push(result.key);
+      // A signature that does not verify is the one rejection that means the peer
+      // is lying rather than merely out of bounds; the caller drops the connection
+      // over it, so grinding forged signatures costs the attacker its session.
+      if (result.reason?.startsWith("bad signature")) summary.forged += 1;
       if (result.reason && !summary.rejections.includes(result.reason)) {
         summary.rejections.push(result.reason);
       }
@@ -321,7 +368,28 @@ function absorb(
     services.log.rewriteClaims(services.store.listClaims());
   }
 
-  const stateKeys = touched.filter((key) => !isClaimKey(key));
+  // A peer joining or changing status is worth waking an agent for on its own —
+  // it is the signal that decides whether work can be handed off — so it is
+  // reported as `presence` rather than buried in a list of changed keys.
+  const agentKeys = touched.filter((key) => isAgentKey(key));
+  if (agentKeys.length > 0 && source === "Peer") {
+    for (const key of agentKeys.slice(0, 20)) {
+      const card = parseCard(services.store.get(key));
+      if (!card) continue;
+      services.events?.emit({
+        kind: "presence",
+        peer: peer?.fingerprint ?? null,
+        holder: nodeIdFromAgentKey(key) ?? undefined,
+        role: card.role,
+        status: card.status,
+        ...(card.task !== undefined ? { taskId: card.task } : {}),
+      });
+    }
+  }
+
+  const stateKeys = touched.filter(
+    (key) => !isClaimKey(key) && !isAgentKey(key),
+  );
   if (stateKeys.length > 0 && source === "Peer") {
     services.events?.emit({
       kind: "state",
@@ -472,6 +540,23 @@ export interface MessageDelivery {
   deliveredNow: number;
   /** Still queued for peers that were not reachable. */
   queued: boolean;
+  /** Correlation id, when the caller asked for a reply. */
+  corr?: string;
+}
+
+export interface SendOptions {
+  /**
+   * Single recipient's public key.
+   *
+   * Omitted broadcasts to everyone paired, which is all v3 could express. Naming
+   * one peer is what makes a swarm workable: without it every question an agent
+   * asks lands in every other agent's feed, and none of them can tell whether it
+   * was meant for them.
+   */
+  to?: string;
+  /** Ties a reply back to the message that prompted it. */
+  corr?: string;
+  intent?: "tell" | "ask" | "reply";
 }
 
 /**
@@ -485,28 +570,56 @@ export function sendMessage(
   services: SyncServices,
   text: string,
   recipients: string[] = [],
+  options: SendOptions = {},
 ): MessageDelivery {
   services.log.syncMessage("Local", text);
 
+  const addressing = {
+    ...(options.to !== undefined ? { to: options.to } : {}),
+    ...(options.corr !== undefined ? { corr: options.corr } : {}),
+    ...(options.intent !== undefined ? { intent: options.intent } : {}),
+  };
+
   if (!services.outbox) {
-    services.p2p?.broadcast({ type: "message", v: PROTOCOL_VERSION, text });
+    services.p2p?.broadcast({
+      type: "message",
+      v: PROTOCOL_VERSION,
+      text,
+      ...addressing,
+    });
     return { id: null, deliveredNow: services.p2p?.connectionCount() ?? 0, queued: false };
   }
 
-  // Addressed to whoever is paired now, so a peer added later does not receive
-  // a backlog of conversation it was never part of.
-  const message = services.outbox.enqueue(text, recipients);
+  // A directed message is queued for its addressee alone. Queuing it for everyone
+  // paired would replay a private exchange to the rest of the swarm the next time
+  // they reconnect.
+  const audience = options.to !== undefined ? [options.to] : recipients;
+  // Addressing is queued with the message, not just sent with it: a question
+  // delivered after a reconnect has to still be answerable.
+  const message = services.outbox.enqueue(text, audience, addressing);
+
+  const targets =
+    options.to !== undefined
+      ? (services.p2p?.connectedKeys() ?? []).filter((key) => key === options.to)
+      : (services.p2p?.connectedKeys() ?? []);
+
   let delivered = 0;
-  for (const key of services.p2p?.connectedKeys() ?? []) {
+  for (const key of targets) {
     const sent = services.p2p?.sendTo(key, {
       type: "message",
       v: PROTOCOL_VERSION,
       text,
       id: message.id,
+      ...addressing,
     });
     if (sent === true) delivered += 1;
   }
-  return { id: message.id, deliveredNow: delivered, queued: true };
+  return {
+    id: message.id,
+    deliveredNow: delivered,
+    queued: true,
+    ...(options.corr !== undefined ? { corr: options.corr } : {}),
+  };
 }
 
 /** Push everything a peer has not confirmed. Called when it connects. */
@@ -523,6 +636,11 @@ export function replayOutbox(
       v: PROTOCOL_VERSION,
       text: message.text,
       id: message.id,
+      // Replayed with the addressing it was queued with, so a question that
+      // waited out a disconnect still arrives as a question the peer can answer.
+      ...(message.to !== undefined ? { to: message.to } : {}),
+      ...(message.corr !== undefined ? { corr: message.corr } : {}),
+      ...(message.intent !== undefined ? { intent: message.intent } : {}),
     });
     if (!ok) break;
     sent += 1;
@@ -553,6 +671,7 @@ export function receiveMessage(
   id: string | undefined,
   peer: AuditPeer | undefined,
   senderPublicKey: string | null,
+  addressing: { corr?: string; intent?: "tell" | "ask" | "reply" } = {},
 ): { duplicate: boolean } {
   // Dedupe is scoped to the sender: a shared id space would let one peer
   // pre-claim an id so another peer's real message is dropped as a duplicate.
@@ -567,6 +686,11 @@ export function receiveMessage(
       kind: "message",
       peer: peer?.fingerprint ?? null,
       text,
+      // Carried through so an agent can answer the question it was asked rather
+      // than guessing which of several open threads a reply belongs to.
+      ...(addressing.corr !== undefined ? { corr: addressing.corr } : {}),
+      ...(addressing.intent !== undefined ? { intent: addressing.intent } : {}),
+      ...(senderPublicKey !== null ? { from: senderPublicKey } : {}),
     });
     if (id !== undefined && senderPublicKey !== null) {
       services.outbox?.markSeen(senderPublicKey, id);
@@ -613,4 +737,17 @@ function broadcastUpdate(services: SyncServices, ops: CrdtOp[]): void {
 /** Current view of the document, for callers that only need plain JSON. */
 export function activeState(services: SyncServices): ContextState {
   return services.store.snapshot();
+}
+
+/**
+ * Publish this node's presence card and tell peers.
+ *
+ * An ordinary local write, so it persists, rides the handshake snapshot, and is
+ * bound to this node's identity by the same rule as everything else.
+ */
+export function announceSelf(
+  services: SyncServices,
+  card: AgentCard,
+): ApplyResult {
+  return commitLocalMutation(services, (store) => store.announce(card));
 }

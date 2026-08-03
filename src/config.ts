@@ -52,6 +52,16 @@ export interface P2paConfig {
   doc?: DocLinkConfig;
   /** Connection policy. Absent on pre-0.7 configs — see `resolveAuthMode`. */
   auth?: AuthMode;
+  /**
+   * Refuse relayed operations that carry no signature.
+   *
+   * Off by default because it excludes v3 peers, which cannot sign. On, it closes
+   * the gap hop-by-hop authentication leaves: a handshake snapshot relays entries
+   * its sender did not author, so in a swarm of three or more an unsigned relay
+   * lets one peer fabricate another's writes. Turn it on with
+   * `p2pa auth require-signatures` once every peer speaks v4.
+   */
+  requireSignatures?: boolean;
   /** Peers permitted to connect when `auth` is `strict`. */
   peers?: PeerEntry[];
 }
@@ -171,6 +181,9 @@ export function readConfig(): P2paConfig | null {
       if (doc) config.doc = doc;
       const auth = parseAuthMode(obj["auth"]);
       if (auth) config.auth = auth;
+      // Only an explicit `true` enables it — a corrupt or truthy-ish value must
+      // not silently change a security policy in either direction.
+      if (obj["requireSignatures"] === true) config.requireSignatures = true;
       const peers = parsePeers(obj["peers"]);
       if (peers) config.peers = peers;
       return config;
@@ -243,6 +256,9 @@ export function writeConfig(config: P2paConfig): void {
   }
   if (config.auth) {
     payload.auth = config.auth;
+  }
+  if (config.requireSignatures === true) {
+    payload.requireSignatures = true;
   }
   if (config.peers) {
     payload.peers = config.peers.map((p) => ({
@@ -363,6 +379,19 @@ export function resolveAuthMode(config: P2paConfig | null): {
   if (!config) return { mode: DEFAULT_AUTH_MODE, legacy: false };
   if (config.auth) return { mode: config.auth, legacy: false };
   return { mode: LEGACY_AUTH_MODE, legacy: true };
+}
+
+/** Is signature enforcement on? Off unless explicitly enabled. */
+export function resolveRequireSignatures(config: P2paConfig | null): boolean {
+  return config?.requireSignatures === true;
+}
+
+/** Turn signature enforcement on or off, preserving every sibling field. */
+export function setRequireSignatures(required: boolean): P2paConfig {
+  return updateConfig((config) => ({
+    ...config,
+    ...(required ? { requireSignatures: true } : { requireSignatures: undefined }),
+  }));
 }
 
 export function setAuthMode(mode: AuthMode): P2paConfig {

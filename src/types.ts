@@ -8,6 +8,17 @@ import {
   MIN_CLAIM_TTL_MS,
   TASK_ID_PATTERN,
 } from "./claim.js";
+import {
+  MAX_CAPABILITIES,
+  MAX_CAPABILITY_LENGTH,
+  MIN_PROTOCOL_VERSION,
+  PROTOCOL_VERSION,
+} from "./protocol.js";
+import {
+  PUBLIC_KEY_HEX_LENGTH,
+  SIGNATURE_B64_LENGTH,
+} from "./signing.js";
+import { isAgentKey, isOwnCard } from "./presence.js";
 
 export type Source = "Local" | "Peer";
 
@@ -38,11 +49,13 @@ export type AuditAction =
  *
  * v2 replaced the `_version`-counter protocol, whose merge rule could not
  * express two writes happening at once. v3 adds message ids and the `ack`
- * envelope that make delivery durable — a v2 peer would silently never
- * acknowledge anything, so the sender would retry the same message on every
- * reconnect for a week. Refusing outright is the honest failure.
+ * envelope that make delivery durable. v4 adds the `hello` handshake, so a
+ * version difference is negotiated instead of silently dropping every frame,
+ * plus per-op signatures, chunked snapshots and addressed messages.
+ *
+ * Re-exported from `protocol.ts`, which owns negotiation.
  */
-export const PROTOCOL_VERSION = 3;
+export { MIN_PROTOCOL_VERSION, PROTOCOL_VERSION };
 
 /** Document key used by the retired counter protocol; dropped on hydrate. */
 export const LEGACY_VERSION_KEY = "_version";
@@ -202,11 +215,28 @@ const HlcSchema = z.object({
   n: z.string().min(1).max(64),
 });
 
+/**
+ * Signature metadata, accepted on every entry kind.
+ *
+ * Bounded to exact lengths so a peer cannot use either field as free payload
+ * space. Both are optional: a v3 peer sends neither, and an unsigned entry is
+ * still merged under the sender-binding rules that predate signatures.
+ */
+const SignatureFieldsSchema = {
+  by: z
+    .string()
+    .length(PUBLIC_KEY_HEX_LENGTH)
+    .regex(/^[0-9a-f]+$/)
+    .optional(),
+  sig: z.string().length(SIGNATURE_B64_LENGTH).optional(),
+};
+
 const LwwEntrySchema = z.object({
   kind: z.literal("lww"),
   hlc: HlcSchema,
   value: z.unknown().optional(),
   deleted: z.boolean().optional(),
+  ...SignatureFieldsSchema,
 });
 
 const ClaimEntrySchema = z.object({
@@ -216,13 +246,45 @@ const ClaimEntrySchema = z.object({
   ttl: z.number().int().min(MIN_CLAIM_TTL_MS).max(MAX_CLAIM_TTL_MS),
   released: z.boolean().optional(),
   note: z.string().max(500).optional(),
+  ...SignatureFieldsSchema,
 });
 
 const OrSetEntrySchema = z.object({
   kind: z.literal("orset"),
   hlc: HlcSchema,
-  adds: z.record(z.unknown()),
-  removes: z.array(z.string().min(1).max(256)).max(10_000),
+  /**
+   * Highest lww stamp this key has carried.
+   *
+   * Declared because Zod strips fields it does not know: without it every
+   * inbound set entry lost its floor at the validation boundary, so the guard
+   * that makes a key flipping between `lww` and `orset` converge regardless of
+   * delivery order held inside one process and nowhere else. A relayed set op
+   * could then union a superseded lineage back into a register that had already
+   * moved past it.
+   */
+  floor: HlcSchema.optional(),
+  /**
+   * Element tags.
+   *
+   * Tags are peer-chosen and used as object keys, so the reserved JavaScript
+   * property names are refused here: `__proto__` in particular behaves as an
+   * inherited accessor rather than an ordinary key, which silently dropped
+   * elements and could rewrite an object's prototype during merge.
+   */
+  adds: z.record(
+    z.string().min(1).max(256).refine((tag) => !isReservedKey(tag), {
+      message: "Reserved property name is not allowed as a set tag",
+    }),
+    z.unknown(),
+  ),
+  removes: z
+    .array(
+      z.string().min(1).max(256).refine((tag) => !isReservedKey(tag), {
+        message: "Reserved property name is not allowed as a set tag",
+      }),
+    )
+    .max(10_000),
+  ...SignatureFieldsSchema,
 });
 
 /** Keys are interpolated into Markdown, so they may not carry structure. */
@@ -267,6 +329,16 @@ const CrdtOpSchema = z
         message: "Reserved key is not allowed",
       });
     }
+    // The retired counter protocol's key. Refused locally since v2, but it used
+    // to merge happily when it arrived from a peer or off disk — so a v1 document
+    // could reintroduce it as an ordinary key and it would sit in the materialized
+    // state looking meaningful. Rejected on every path in, as SPEC §5.1 says.
+    if (op.key === LEGACY_VERSION_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Key belonged to the retired counter protocol",
+      });
+    }
     const claimKey = op.key.startsWith(CLAIM_KEY_PREFIX);
     if (claimKey) {
       const taskId = op.key.slice(CLAIM_KEY_PREFIX.length);
@@ -286,6 +358,23 @@ const CrdtOpSchema = z
           ? "Lease namespace accepts only lease entries"
           : "Lease entry outside the lease namespace",
       });
+    }
+    // A presence card is only meaningful in the one slot its author owns.
+    // Checked here so a forged card is refused at the validation boundary, on
+    // every path in — wire, snapshot relay, and the on-disk replica alike.
+    if (isAgentKey(op.key)) {
+      if (op.entry.kind !== "lww") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Agent namespace accepts only presence cards",
+        });
+      } else if (!isOwnCard(op.key, op.entry.hlc.n)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "Presence card is stamped by a node other than the one it describes",
+        });
+      }
     }
     if (exceedsDepth(op.entry)) {
       ctx.addIssue({
@@ -309,43 +398,130 @@ export const CrdtOpArraySchema = z
   })
   .transform((ops) => ops as unknown as CrdtOp[]);
 
+/**
+ * Version field.
+ *
+ * A range, never a literal. Pinning it to one number meant a peer on any other
+ * build had every frame fail validation and get dropped with a single stderr
+ * line — two paired machines would sit connected and never sync, with nothing to
+ * tell either operator why, and no version could ever be added without breaking
+ * every node already deployed. Frames are accepted across the supported range
+ * and `protocol.ts` settles which version the connection actually speaks.
+ */
+const VersionSchema = z
+  .number()
+  .int()
+  .min(MIN_PROTOCOL_VERSION)
+  .max(PROTOCOL_VERSION);
+
+/** Max snapshot parts in one handshake, bounding a chunked transfer. */
+export const MAX_SNAPSHOT_PARTS = 512;
+
+/** Max recipients addressable by a single message. */
+export const MAX_MESSAGE_RECIPIENT_LENGTH = PUBLIC_KEY_HEX_LENGTH;
+
+/** Max characters in a correlation id. */
+export const MAX_CORRELATION_LENGTH = 64;
+
+const SnapshotOpsSchema = z
+  .array(CrdtOpSchema)
+  .max(MAX_OPS_PER_ENVELOPE)
+  .superRefine((ops, ctx) => {
+    if (JSON.stringify(ops).length > MAX_PAYLOAD_BYTES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Snapshot exceeds max size of ${MAX_PAYLOAD_BYTES} bytes`,
+      });
+    }
+  })
+  .transform((ops) => ops as unknown as CrdtOp[]);
+
 /** Inbound/outbound NDJSON peer envelopes. */
 export const PeerEnvelopeSchema = z.discriminatedUnion("type", [
+  /**
+   * Opening frame, sent by both sides before anything else.
+   *
+   * Absent on a v3 peer, which is exactly how one is recognised.
+   */
+  z.object({
+    type: z.literal("hello"),
+    v: VersionSchema,
+    /** Oldest and newest version the sender can speak. */
+    min: z.number().int().min(1).max(1_000),
+    max: z.number().int().min(1).max(1_000),
+    /** Sender's node id, cross-checked against the stamps it later sends. */
+    node: z.string().min(1).max(64),
+    caps: z
+      .array(z.string().min(1).max(MAX_CAPABILITY_LENGTH))
+      .max(MAX_CAPABILITIES)
+      .default([]),
+    /** Replica digests, so two already-matching peers skip the snapshot. */
+    digest: z
+      .object({ state: z.string().max(64), claims: z.string().max(64) })
+      .optional(),
+    /** Human-facing label, sanitized before display. Never an identity. */
+    label: z.string().max(64).optional(),
+  }),
   z.object({
     type: z.literal("update"),
-    v: z.literal(PROTOCOL_VERSION),
+    v: VersionSchema,
     ops: CrdtOpArraySchema,
   }),
   z.object({
     type: z.literal("message"),
-    v: z.literal(PROTOCOL_VERSION),
+    v: VersionSchema,
     text: z.string().min(1).max(MAX_PAYLOAD_BYTES),
     /**
      * Optional so a build without an outbox still interoperates. Present, it
      * lets the receiver drop a replay and confirm receipt.
      */
     id: z.string().min(1).max(64).optional(),
+    /**
+     * Intended recipient's public key.
+     *
+     * Absent means "everyone on this topic", which is all v3 could express. A
+     * receiver that is not the addressee drops the frame without logging it, so
+     * a directed question does not surface in every other agent's feed.
+     */
+    to: z.string().length(MAX_MESSAGE_RECIPIENT_LENGTH).regex(/^[0-9a-f]+$/).optional(),
+    /** Ties a reply to the question that prompted it. */
+    corr: z.string().min(1).max(MAX_CORRELATION_LENGTH).optional(),
+    /** What the sender wants: a statement, a question, or an answer. */
+    intent: z.enum(["tell", "ask", "reply"]).optional(),
   }),
   z.object({
     type: z.literal("ack"),
-    v: z.literal(PROTOCOL_VERSION),
+    v: VersionSchema,
     ids: z.array(z.string().min(1).max(64)).min(1).max(200),
   }),
   z.object({
     type: z.literal("snapshot"),
-    v: z.literal(PROTOCOL_VERSION),
-    ops: z
-      .array(CrdtOpSchema)
-      .max(MAX_OPS_PER_ENVELOPE)
-      .superRefine((ops, ctx) => {
-        if (JSON.stringify(ops).length > MAX_PAYLOAD_BYTES) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: `Snapshot exceeds max size of ${MAX_PAYLOAD_BYTES} bytes`,
-          });
-        }
-      })
-      .transform((ops) => ops as unknown as CrdtOp[]),
+    v: VersionSchema,
+    ops: SnapshotOpsSchema,
+    /**
+     * Position in a chunked transfer, 1-based, both omitted by a v3 peer.
+     *
+     * A replica larger than `MAX_PAYLOAD_BYTES` used to be untransmittable: the
+     * whole document went out as one frame, the receiver's framing check
+     * destroyed the connection over it, and because the snapshot is sent on every
+     * connect the two nodes retried that forever and never converged. Merging is
+     * commutative and idempotent, so each part is applied as it lands and nothing
+     * has to be buffered.
+     */
+    part: z.number().int().min(1).max(MAX_SNAPSHOT_PARTS).optional(),
+    of: z.number().int().min(1).max(MAX_SNAPSHOT_PARTS).optional(),
+  }),
+  /**
+   * Graceful close with a stated reason.
+   *
+   * The point is the operator: "peer speaks v5, this node speaks v4" in the log
+   * beats a connection that drops with no explanation.
+   */
+  z.object({
+    type: z.literal("bye"),
+    v: VersionSchema,
+    reason: z.string().min(1).max(64),
+    detail: z.string().max(500).optional(),
   }),
 ]);
 
