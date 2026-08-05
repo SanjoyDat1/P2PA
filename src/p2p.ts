@@ -7,6 +7,7 @@ import { sanitizeLabel, shortFingerprint } from "./peer-key.js";
 import {
   CAP_ADDRESSED_MESSAGES,
   CAP_CHUNKED_SNAPSHOT,
+  CAP_TASKS,
   LOCAL_PROFILE,
   MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
@@ -23,7 +24,8 @@ import {
   PeerEnvelopeSchema,
   type PeerEnvelope,
 } from "./types.js";
-import { MAX_CLAIM_KEYS, MAX_CRDT_KEYS, type CrdtOp } from "./crdt.js";
+import { MAX_CLAIM_KEYS, MAX_CRDT_KEYS, MAX_TASK_KEYS, type CrdtOp } from "./crdt.js";
+import { isTaskKey } from "./task.js";
 import { nodeIdFromPublicKey } from "./hlc.js";
 
 /**
@@ -40,7 +42,8 @@ export const SNAPSHOT_PART_BUDGET = 512 * 1024;
  * There is no point receiving more entries than the document can hold, so this
  * is the natural bound: a peer cannot use a chunked transfer to stream forever.
  */
-export const SNAPSHOT_MAX_TOTAL_OPS = MAX_CRDT_KEYS + MAX_CLAIM_KEYS;
+export const SNAPSHOT_MAX_TOTAL_OPS =
+  MAX_CRDT_KEYS + MAX_CLAIM_KEYS + MAX_TASK_KEYS;
 
 /** How long to wait for a peer's hello before assuming it is a v3 node. */
 export const HELLO_TIMEOUT_MS = 5_000;
@@ -688,7 +691,9 @@ export class P2PNode {
       return;
     }
 
-    const ops = this.getActiveState();
+    // Filtered before chunking, not after, so the part counts the receiver
+    // checks against still describe what it is actually sent.
+    const ops = opsForPeer(this.getActiveState(), capsOf(state));
     const chunked =
       state.negotiated?.ok === true && state.negotiated.caps.has(CAP_CHUNKED_SNAPSHOT);
 
@@ -747,7 +752,13 @@ export class P2PNode {
   ): void {
     const version =
       state.negotiated?.ok === true ? state.negotiated.version : MIN_PROTOCOL_VERSION;
-    this.writeLine(conn, state, encodeNdjsonLine(downgrade(envelope, version, state)));
+    const shaped = downgrade(envelope, version, capsOf(state));
+    // Nothing left to say. An update whose every op was filtered out must not be
+    // written as an empty `ops` array: `CrdtOpArraySchema` has `.min(1)`, so the
+    // receiver would reject the frame and — depending on its accounting — count
+    // a peer sending nothing as a peer sending garbage.
+    if (shaped === null) return;
+    this.writeLine(conn, state, encodeNdjsonLine(shaped));
   }
 
   /**
@@ -1142,25 +1153,59 @@ export class P2PNode {
   }
 }
 
+const NO_CAPS: ReadonlySet<string> = new Set<string>();
+
+/** Capabilities settled for a connection, or none until it has negotiated. */
+function capsOf(state: ConnState): ReadonlySet<string> {
+  return state.negotiated?.ok === true ? state.negotiated.caps : NO_CAPS;
+}
+
 /**
- * Remove fields a peer on an older version cannot read.
+ * Ops a peer can actually accept.
  *
- * Sending them anyway is not harmless: v3 validates with a fixed shape, so an
- * unknown field is silently dropped and the sender is left believing it
- * addressed a message that the receiver treated as a broadcast.
+ * Pure and exported for the same reason `shouldBlockPeer` is: a filter only
+ * reachable through a live DHT connection is a filter nobody checks, and this
+ * one is load-bearing rather than cosmetic. A peer that did not negotiate `task`
+ * validates entries as a *discriminated union*, so one unknown `kind` makes it
+ * discard the entire frame — an unfiltered snapshot gives such a peer no sync at
+ * all, not a degraded one.
  */
-function downgrade(
+export function opsForPeer(ops: CrdtOp[], caps: ReadonlySet<string>): CrdtOp[] {
+  return caps.has(CAP_TASKS) ? ops : ops.filter((op) => !isTaskKey(op.key));
+}
+
+/**
+ * Shape a frame for what this connection can actually read.
+ *
+ * Sending a field a peer cannot read is not harmless: v3 validates with a fixed
+ * shape, so an unknown field is silently dropped and the sender is left
+ * believing it addressed a message the receiver treated as a broadcast.
+ *
+ * Entry kinds are worse than fields. A kind is discriminated, not additive, so a
+ * receiver that does not know `task` rejects the whole frame rather than the one
+ * op — which is why the task filter runs before the version shortcut below: a
+ * peer can speak protocol v4 and still predate this namespace, and it must not
+ * lose every unrelated state op riding in the same update.
+ *
+ * Returns `null` when nothing survives the filter. An `update` reduced to an
+ * empty `ops` array is not writable: `CrdtOpArraySchema` has `.min(1)`, so the
+ * receiver would refuse the frame and count us as a peer sending garbage.
+ */
+export function downgrade(
   envelope: PeerEnvelope,
   version: number,
-  state: ConnState,
-): PeerEnvelope {
+  caps: ReadonlySet<string>,
+): PeerEnvelope | null {
+  if (envelope.type === "update" && !caps.has(CAP_TASKS)) {
+    const ops = opsForPeer(envelope.ops, caps);
+    if (ops.length === 0) return null;
+    if (ops.length !== envelope.ops.length) return { ...envelope, ops, v: version };
+  }
+
   if (version >= PROTOCOL_VERSION) return { ...envelope, v: version };
 
   if (envelope.type === "message") {
-    const addressed =
-      state.negotiated?.ok === true &&
-      state.negotiated.caps.has(CAP_ADDRESSED_MESSAGES);
-    if (addressed) return { ...envelope, v: version };
+    if (caps.has(CAP_ADDRESSED_MESSAGES)) return { ...envelope, v: version };
     const { to: _to, corr: _corr, intent: _intent, ...rest } = envelope;
     return { ...rest, v: version };
   }

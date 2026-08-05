@@ -18,7 +18,21 @@ import {
   PUBLIC_KEY_HEX_LENGTH,
   SIGNATURE_B64_LENGTH,
 } from "./signing.js";
-import { isAgentKey, isOwnCard } from "./presence.js";
+import { MAX_CAPABILITY_TEXT, isAgentKey, isOwnCard } from "./presence.js";
+import { NODE_ID_LENGTH } from "./hlc.js";
+import {
+  MAX_ACCEPTED_TASK_ATTEMPTS,
+  MAX_TASK_DEPS,
+  MAX_TASK_DETAIL,
+  MAX_TASK_ERROR,
+  MAX_TASK_NEEDS,
+  MAX_TASK_PRIORITY,
+  MAX_TASK_RESULT_BYTES,
+  MAX_TASK_TITLE,
+  MIN_TASK_PRIORITY,
+  TASK_KEY_PREFIX,
+  TASK_STATUS,
+} from "./task.js";
 
 export type Source = "Local" | "Peer";
 
@@ -42,7 +56,9 @@ export type AuditAction =
   | "Override"
   | "Rejected Update"
   | "Claim"
-  | "Release";
+  | "Release"
+  | "Task Created"
+  | "Task Settled";
 
 /**
  * Wire protocol version.
@@ -195,6 +211,35 @@ export interface ReleaseAudit {
   generation: number;
 }
 
+export interface TaskCreatedAudit {
+  source: Source;
+  peer?: AuditPeer;
+  action: "Task Created";
+  taskId: string;
+  title: string;
+  priority: number;
+  needs: string[];
+  deps: string[];
+}
+
+/**
+ * A task reaching an outcome.
+ *
+ * `settledBy` is the node that wrote the outcome, which is not necessarily the
+ * node that held the lease and not necessarily the creator — any allowlisted
+ * peer may settle any task, and the audit trail is where that is visible.
+ */
+export interface TaskSettledAudit {
+  source: Source;
+  peer?: AuditPeer;
+  action: "Task Settled";
+  taskId: string;
+  status: string;
+  attempt: number;
+  settledBy: string;
+  detail?: string;
+}
+
 export type AuditEntry =
   | StateUpdateAudit
   | StateSnapshotAudit
@@ -203,7 +248,9 @@ export type AuditEntry =
   | OverrideAudit
   | RejectedUpdateAudit
   | ClaimAudit
-  | ReleaseAudit;
+  | ReleaseAudit
+  | TaskCreatedAudit
+  | TaskSettledAudit;
 
 export function isReservedKey(key: string): boolean {
   return (RESERVED_KEYS as readonly string[]).includes(key);
@@ -246,6 +293,34 @@ const ClaimEntrySchema = z.object({
   ttl: z.number().int().min(MIN_CLAIM_TTL_MS).max(MAX_CLAIM_TTL_MS),
   released: z.boolean().optional(),
   note: z.string().max(500).optional(),
+  ...SignatureFieldsSchema,
+});
+
+/**
+ * A backlog entry.
+ *
+ * Every field here arrives from a peer, including the ones a human reads, so
+ * every field is bounded. `needs` shares `MAX_CAPABILITY_TEXT` with a presence
+ * card deliberately: a requirement token and a capability token that could
+ * differ in length would silently stop matching at the boundary between them.
+ */
+const TaskEntrySchema = z.object({
+  kind: z.literal("task"),
+  hlc: HlcSchema,
+  title: z.string().min(1).max(MAX_TASK_TITLE),
+  detail: z.string().max(MAX_TASK_DETAIL).optional(),
+  needs: z
+    .array(z.string().min(1).max(MAX_CAPABILITY_TEXT))
+    .max(MAX_TASK_NEEDS)
+    .optional(),
+  deps: z.array(z.string().regex(TASK_ID_PATTERN)).max(MAX_TASK_DEPS).optional(),
+  priority: z.number().int().min(MIN_TASK_PRIORITY).max(MAX_TASK_PRIORITY),
+  status: z.enum(TASK_STATUS),
+  result: z.unknown().optional(),
+  lastError: z.string().max(MAX_TASK_ERROR).optional(),
+  attempts: z.number().int().min(0).max(MAX_ACCEPTED_TASK_ATTEMPTS),
+  createdBy: z.string().min(1).max(NODE_ID_LENGTH),
+  createdAt: z.number().int().nonnegative(),
   ...SignatureFieldsSchema,
 });
 
@@ -320,6 +395,7 @@ const CrdtOpSchema = z
       LwwEntrySchema,
       OrSetEntrySchema,
       ClaimEntrySchema,
+      TaskEntrySchema,
     ]),
   })
   .superRefine((op, ctx) => {
@@ -357,6 +433,39 @@ const CrdtOpSchema = z
         message: claimKey
           ? "Lease namespace accepts only lease entries"
           : "Lease entry outside the lease namespace",
+      });
+    }
+    const taskKey = op.key.startsWith(TASK_KEY_PREFIX);
+    if (taskKey) {
+      const taskId = op.key.slice(TASK_KEY_PREFIX.length);
+      if (!TASK_ID_PATTERN.test(taskId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Malformed task id in task key",
+        });
+      }
+    }
+    // Tasks and state never share a key either, on any path in.
+    if (taskKey !== (op.entry.kind === "task")) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: taskKey
+          ? "Task namespace accepts only task entries"
+          : "Task entry outside the task namespace",
+      });
+    }
+    // A result is a handover, not a payload channel. Checked on the serialized
+    // form because that is what rides every snapshot from here on.
+    if (
+      op.entry.kind === "task" &&
+      op.entry.result !== undefined &&
+      JSON.stringify(op.entry.result).length > MAX_TASK_RESULT_BYTES
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          `Task result exceeds ${MAX_TASK_RESULT_BYTES} bytes; ` +
+          `publish the payload with push_context and reference it from the result`,
       });
     }
     // A presence card is only meaningful in the one slot its author owns.
@@ -457,7 +566,17 @@ export const PeerEnvelopeSchema = z.discriminatedUnion("type", [
       .default([]),
     /** Replica digests, so two already-matching peers skip the snapshot. */
     digest: z
-      .object({ state: z.string().max(64), claims: z.string().max(64) })
+      .object({
+        state: z.string().max(64),
+        claims: z.string().max(64),
+        /**
+         * Backlog digest. Absent from a peer that predates the `@task/`
+         * namespace, which is why it is optional and why an empty backlog
+         * hashes to the empty string — otherwise every mixed swarm would
+         * mismatch and re-ship the whole document on every reconnect.
+         */
+        tasks: z.string().max(64).optional(),
+      })
       .optional(),
     /** Human-facing label, sanitized before display. Never an identity. */
     label: z.string().max(64).optional(),

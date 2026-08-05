@@ -12,16 +12,32 @@ import {
   type JsonValue,
   type Source,
 } from "./types.js";
+import { randomUUID } from "node:crypto";
 import { nodeIdFromPublicKey } from "./hlc.js";
+import { canonicalJson } from "./canonical.js";
 import type { EventBus } from "./events.js";
 import type { Outbox } from "./outbox.js";
 import {
   describeClaim,
+  holderOf,
   isClaimKey,
   taskIdFromKey,
   type ClaimEntry,
   type ClaimView,
 } from "./claim.js";
+import {
+  MAX_ACCEPTED_TASK_ATTEMPTS,
+  TASK_MAX_ATTEMPTS,
+  draftFrom,
+  isTaskKey,
+  isTerminal,
+  selectCandidates,
+  taskIdFromTaskKey,
+  type AbandonReport,
+  type AbandonedTasks,
+  type TaskStatus,
+  type TaskView,
+} from "./task.js";
 import { isSigned } from "./signing.js";
 import {
   isAgentKey,
@@ -387,8 +403,85 @@ function absorb(
     }
   }
 
+  // One rewrite for the whole batch here too, and the views are built once
+  // rather than per key: `listTasks` walks the backlog, so doing it per touched
+  // key would make a single envelope cost time quadratic in its size.
+  const taskKeys = touched.filter((key) => isTaskKey(key));
+  if (taskKeys.length > 0) {
+    const views = services.store.listTasks();
+    const byId = new Map(views.map((view) => [view.taskId, view]));
+    const finished: string[] = [];
+
+    for (const key of taskKeys.slice(0, 50)) {
+      const taskId = taskIdFromTaskKey(key);
+      const view = taskId === null ? undefined : byId.get(taskId);
+      if (!view) continue;
+      if (view.status === "done") finished.push(view.taskId);
+      // Emission stays peer-only, like `claim`/`release`/`presence`: a local
+      // write does not need to wake the agent that just made it. `touched` only
+      // holds keys where the merge actually changed something, so a re-delivered
+      // completion merges to "ignored" and raises nothing.
+      if (source !== "Peer") continue;
+      if (view.status === "done") {
+        services.events?.emit({
+          kind: "task_done",
+          peer: peer?.fingerprint ?? null,
+          taskId: view.taskId,
+          status: view.status,
+          ...(view.lastHolder !== null ? { holder: view.lastHolder } : {}),
+          text: view.result === null ? view.title : canonicalJson(view.result),
+        });
+        continue;
+      }
+      if (view.status === "failed" || view.status === "cancelled") {
+        services.events?.emit({
+          kind: "task_failed",
+          peer: peer?.fingerprint ?? null,
+          taskId: view.taskId,
+          status: view.status,
+          ...(view.lastHolder !== null ? { holder: view.lastHolder } : {}),
+          text: view.lastError ?? view.title,
+        });
+        continue;
+      }
+      services.events?.emit({
+        kind: "task",
+        peer: peer?.fingerprint ?? null,
+        taskId: view.taskId,
+        status: view.status,
+        text: view.title,
+      });
+    }
+
+    // A dependency clearing is the other half of the delegation loop: without
+    // it an agent blocked on somebody else's work has nothing to wake on.
+    if (source === "Peer" && finished.length > 0) {
+      let announced = 0;
+      for (const doneId of finished.slice(0, 50)) {
+        for (const candidate of views) {
+          if (announced >= 20) break;
+          if (candidate.status !== "open") continue;
+          if (!candidate.deps.includes(doneId)) continue;
+          if (candidate.blockedBy.length > 0) continue;
+          services.events?.emit({
+            kind: "task_ready",
+            peer: peer?.fingerprint ?? null,
+            taskId: candidate.taskId,
+            text: `unblocked by ${doneId}`,
+          });
+          announced += 1;
+        }
+      }
+    }
+
+    services.log.rewriteBacklog(views);
+  }
+
+  // Tasks are excluded here as well as leases and cards: a generic `state`
+  // event naming `@task/…` keys would send an agent to `pull_context`, which
+  // deliberately cannot resolve them.
   const stateKeys = touched.filter(
-    (key) => !isClaimKey(key) && !isAgentKey(key),
+    (key) => !isClaimKey(key) && !isAgentKey(key) && !isTaskKey(key),
   );
   if (stateKeys.length > 0 && source === "Peer") {
     services.events?.emit({
@@ -532,6 +625,303 @@ export function releaseTask(
   });
   services.log.rewriteClaims(services.store.listClaims());
   return { ok: true, view };
+}
+
+export type TaskOutcome =
+  | { ok: true; view: TaskView; unblocked: string[]; alreadySettled: boolean }
+  | { ok: false; error: string; holder?: string };
+
+export type TaskCreation =
+  | { ok: true; taskId: string; view: TaskView }
+  | { ok: false; error: string };
+
+/** Bytes of uniqueness appended to a slugged title. */
+const TASK_ID_SUFFIX_LENGTH = 6;
+
+/** The view of a task after a write, for callers that need to report it. */
+function viewOf(services: SyncServices, taskId: string): TaskView | undefined {
+  return services.store.listTasks().find((view) => view.taskId === taskId);
+}
+
+/**
+ * Put work on the shared backlog.
+ *
+ * No lease is taken. Creating a task says the work exists and what it needs, not
+ * that this agent is doing it — those are separate questions and conflating them
+ * is what a `holder` field on a task would do.
+ */
+export function createTask(
+  services: SyncServices,
+  input: {
+    title: string;
+    detail?: string;
+    needs?: string[];
+    deps?: string[];
+    priority?: number;
+    taskId?: string;
+  },
+): TaskCreation {
+  const suffix = randomUUID().replace(/-/g, "").slice(0, TASK_ID_SUFFIX_LENGTH);
+  const created = services.store.createTask({ ...input, suffix });
+  if (!created.ok) return created;
+
+  const committed = commitLocalMutation(services, () => created.op);
+  if (!committed.ok) return { ok: false, error: committed.error };
+
+  const views = services.store.listTasks();
+  const view = views.find((candidate) => candidate.taskId === created.taskId);
+  if (!view) return { ok: false, error: `Could not read back "${created.taskId}"` };
+
+  services.log.syncMarkdownLog({
+    source: "Local",
+    action: "Task Created",
+    taskId: view.taskId,
+    title: view.title,
+    priority: view.priority,
+    needs: view.needs,
+    deps: view.deps,
+  });
+  services.log.rewriteBacklog(views);
+  return { ok: true, taskId: created.taskId, view };
+}
+
+/**
+ * Record that a task is finished, with what came out of it.
+ *
+ * The task is written **before** the lease is released, and the order is not
+ * incidental. Releasing first and then crashing leaves an open, unleased task
+ * that somebody else redoes from scratch; completing first and then crashing
+ * leaves a finished task under a lease that expires harmlessly.
+ */
+export function completeTask(
+  services: SyncServices,
+  taskId: string,
+  result?: JsonValue,
+): TaskOutcome {
+  return settle(services, taskId, { status: "done", ...(result !== undefined ? { result } : {}) });
+}
+
+/**
+ * Give up on an attempt.
+ *
+ * `requeue` puts the work back for somebody else instead of losing it;
+ * `outcome: "cancelled"` says nobody should attempt it again. Both are terminal
+ * for *this* attempt, which is why they share a tool and a code path.
+ */
+export function failTask(
+  services: SyncServices,
+  taskId: string,
+  reason: string,
+  options: { requeue?: boolean; outcome?: "failed" | "cancelled" } = {},
+): TaskOutcome {
+  const entry = services.store.task(taskId);
+  if (!entry) {
+    return {
+      ok: false,
+      error:
+        `No task "${taskId}" is on the backlog. Call list_tasks to see what is, ` +
+        `or create_task to add it.`,
+    };
+  }
+  // Bounded so a peer that has already pushed `attempts` to the ceiling cannot
+  // make a local retry produce an entry every replica then rejects.
+  const attempts = Math.min(entry.attempts + 1, MAX_ACCEPTED_TASK_ATTEMPTS);
+  const requeue = options.requeue !== false;
+  const status: TaskStatus =
+    options.outcome === "cancelled"
+      ? "cancelled"
+      : requeue && attempts < TASK_MAX_ATTEMPTS
+        ? "open"
+        : "failed";
+  return settle(services, taskId, { status, attempts, lastError: reason });
+}
+
+/**
+ * The write half of `complete_task` and `fail_task`.
+ *
+ * The already-settled check makes the *tool* idempotent, which the lattice alone
+ * does not: merge is idempotent over the same op, but a second `complete_task`
+ * carrying a different result is a different op, and without this the second
+ * caller would overwrite the first completer's answer.
+ */
+function settle(
+  services: SyncServices,
+  taskId: string,
+  patch: { status: TaskStatus; result?: JsonValue; attempts?: number; lastError?: string },
+): TaskOutcome {
+  const entry = services.store.task(taskId);
+  if (!entry) {
+    return {
+      ok: false,
+      error:
+        `No task "${taskId}" is on the backlog. Call list_tasks to see what is, ` +
+        `or create_task to add it.`,
+    };
+  }
+  if (isTerminal(entry.status)) {
+    const settled = viewOf(services, taskId);
+    return settled
+      ? { ok: true, view: settled, unblocked: [], alreadySettled: true }
+      : { ok: false, error: `Could not read back "${taskId}"` };
+  }
+
+  const now = services.store.nowMs();
+  const lease = services.store.claim(taskId);
+  const holder = lease ? holderOf(lease, now) : null;
+  if (holder !== null && holder !== services.store.nodeId) {
+    // An ergonomic guard, not a security boundary: any allowlisted peer can
+    // write this entry directly, and the merge rules will accept it. What this
+    // stops is the ordinary mistake of settling work another agent is still
+    // doing, which is worth a clear error rather than a silent overwrite.
+    return {
+      ok: false,
+      holder,
+      error:
+        `"${taskId}" is currently leased by ${holder}. Ask that agent with ` +
+        `ask_peer before settling work it may still be doing.`,
+    };
+  }
+
+  const blockedBefore = openDependents(services, taskId);
+
+  const committed = commitLocalMutation(services, (store) =>
+    store.putTask(taskId, draftFrom(entry, patch)),
+  );
+  if (!committed.ok) return { ok: false, error: committed.error };
+  if (committed.ops.length === 0) {
+    return { ok: false, error: `The backlog already holds that outcome for "${taskId}"` };
+  }
+
+  // Lease second. See the ordering note on `completeTask`.
+  if (holder === services.store.nodeId) releaseTask(services, taskId);
+
+  const views = services.store.listTasks();
+  const view = views.find((candidate) => candidate.taskId === taskId);
+  if (!view) return { ok: false, error: `Could not read back "${taskId}"` };
+
+  services.log.syncMarkdownLog({
+    source: "Local",
+    action: "Task Settled",
+    taskId,
+    status: view.status,
+    attempt: view.attempts,
+    settledBy: services.store.nodeId,
+    ...(view.lastError !== null ? { detail: view.lastError } : {}),
+  });
+
+  // Dependents that were waiting on this task and are now waiting on nothing.
+  // Computed from the pre-write list, so a task blocked on something else too is
+  // not reported as freed.
+  const cleared = new Set(
+    views
+      .filter((candidate) => candidate.blockedBy.length === 0)
+      .map((candidate) => candidate.taskId),
+  );
+  const unblocked =
+    view.status === "done" ? blockedBefore.filter((id) => cleared.has(id)) : [];
+
+  services.log.rewriteBacklog(views);
+  return { ok: true, view, unblocked, alreadySettled: false };
+}
+
+/**
+ * Candidates `next_task` will race for before telling the agent there is none.
+ *
+ * Each settle costs one propagation window when peers are connected, so an
+ * uncapped loop over a contended board would block an agent for minutes inside
+ * one tool call. Five bounds the worst case to about 1.25 s, and a swarm that
+ * loses five races in a row has more agents than work.
+ */
+export const MAX_NEXT_TASK_ATTEMPTS = 5;
+
+export type NextTaskOutcome =
+  | { ok: true; view: TaskView; lease: ClaimView }
+  | { ok: false; candidates: number };
+
+/**
+ * Select a task, lease it, and confirm the lease — in one call.
+ *
+ * Selection and leasing are deliberately not two tools. An agent that picks a
+ * task and then claims it has a window in which it has decided to do work it
+ * does not hold, and every agent in the swarm has the same window at once.
+ *
+ * The claim goes through `claimTask` and the confirmation through the caller's
+ * `settle`, which is the ordinary lease path and not a second one: nothing here
+ * knows what a generation is. Losing the settle means a peer already holds the
+ * task, so the loop moves on **without releasing anything** — there is nothing
+ * of ours to give up, and releasing would hand back the winner's lease.
+ */
+export async function takeNextTask(
+  services: SyncServices,
+  options: {
+    /** The board, already read — the caller needs it for the empty-state text. */
+    views: TaskView[];
+    capabilities: ReadonlySet<string>;
+    capability?: string;
+    ttlMs: number;
+    maxAttempts?: number;
+  },
+  settle: (taskId: string) => Promise<boolean>,
+): Promise<NextTaskOutcome> {
+  const candidates = selectCandidates(options.views, {
+    capabilities: options.capabilities,
+    ...(options.capability !== undefined ? { capability: options.capability } : {}),
+  });
+
+  for (const candidate of candidates.slice(
+    0,
+    options.maxAttempts ?? MAX_NEXT_TASK_ATTEMPTS,
+  )) {
+    const taken = claimTask(
+      services,
+      candidate.taskId,
+      options.ttlMs,
+      candidate.title.slice(0, 500),
+    );
+    if (!taken.ok) continue;
+    if (!(await settle(candidate.taskId))) continue;
+    const view = viewOf(services, candidate.taskId);
+    if (!view) continue;
+    return { ok: true, view, lease: taken.view };
+  }
+  return { ok: false, candidates: candidates.length };
+}
+
+/**
+ * Announce every open task whose lease lapsed with nothing recorded.
+ *
+ * Driven by an agent asking the board a question rather than by a timer. A timer
+ * would look like a failure detector, and P2PA does not have one — reporting
+ * abandonment lazily is the honest shape for a system with no liveness guarantee
+ * to offer. `peer` is null because nothing arrived: this is an observation this
+ * node made, not something a peer told us.
+ */
+export function reportAbandoned(
+  services: SyncServices,
+  tracker: AbandonedTasks,
+  views: TaskView[],
+): AbandonReport[] {
+  const reports = tracker.sweep(views);
+  for (const report of reports) {
+    services.events?.emit({
+      kind: "task_abandoned",
+      peer: null,
+      taskId: report.taskId,
+      holder: report.holder,
+      text: report.title,
+    });
+  }
+  return reports;
+}
+
+/** Open tasks that name this one as a dependency. */
+function openDependents(services: SyncServices, taskId: string): string[] {
+  return services.store
+    .taskEntries()
+    .filter(
+      ({ entry }) => entry.status === "open" && (entry.deps ?? []).includes(taskId),
+    )
+    .map(({ taskId: id }) => id);
 }
 
 export interface MessageDelivery {

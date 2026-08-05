@@ -368,7 +368,12 @@ Once connected, agents can call:
 
 | Tool | What it does |
 |------|----------------|
-| `claim_task` | Take a lease on a task so a peer does not start the same work |
+| `create_task` | Put a unit of work on the shared backlog for any qualified agent |
+| `next_task` | Ask the backlog for work you can run — and take the lease in the same call |
+| `complete_task` | Record the outcome, hand back the result, release the lease |
+| `fail_task` | Give up an attempt: requeue it, dead-letter it, or cancel it |
+| `list_tasks` | The board: what exists, what is blocked, who holds what |
+| `claim_task` | Take a lease directly, for work that is not on the backlog |
 | `release_task` | Hand a task back before its lease expires |
 | `list_claims` | See which tasks are in flight and who holds them |
 
@@ -404,6 +409,49 @@ Once connected, agents can call:
 | `doc_publish` | Push status / plan / agent_log to the linked Google Doc |
 | `doc_read_steering` | Read HUMAN directives (optional force poll) |
 | `doc_status` | Living-doc link + poll health (no secrets) |
+
+### Delegating work
+
+A lease is a lock over a task id, and until v0.9 a task id referred to nothing —
+two agents describing the same work differently each took a lease and both did the
+job. The backlog is that missing vocabulary: work becomes an object with a shared
+id, a result, and a lifecycle other agents can wait on.
+
+```
+Agent A: create_task(title: "Port the auth module to the new token API",
+                     needs: ["typescript"], priority: 7)
+         → "port-the-auth-module-to-the-new-toke-4f8c2a"
+Agent A: create_task(title: "Write migration notes",
+                     deps: ["port-the-auth-module-to-the-new-toke-4f8c2a"])
+         → blocked until the first is done
+Agent A: await_peer_event()
+
+Agent B: next_task()          → the auth task, leased to B until 18:07:19Z
+         … work happens …
+Agent B: complete_task(task_id: "port-the-auth-…", result: {files: 6})
+
+Agent A: ← wakes with { kind: "task_done",  taskId: "port-the-auth-…" }
+                      { kind: "task_ready", taskId: "write-migration-notes-…" }
+```
+
+`next_task` selects **and** leases in one call, so there is no window in which an
+agent has decided to do work it does not hold. It never offers a task whose
+dependencies are unfinished, one needing a capability the agent has not announced,
+or one a peer already holds — and when there is nothing for you it says so, with
+the counts, rather than returning an error.
+
+A task **never records who is working on it**. `@task/<id>` holds the work and
+`@claim/<id>` holds the lease; they share an id and are joined when you read the
+board. A `holder` field on the task would be a second answer to a question the
+lease already answers, and the two would disagree the first time a holder crashed.
+
+`fail_task` puts the work back rather than losing it — after three attempts it is
+dead-lettered with the reason on the board. An agent that crashes mid-task simply
+lets its lease lapse; the task stays `open` and is reported to the swarm as
+abandoned the next time anyone asks for work.
+
+The board is also written into `~/.p2pa/shared_context.md` under `## Backlog`, so
+a human can read what the swarm is doing without asking it.
 
 ### Claiming work
 
@@ -575,6 +623,20 @@ p2pa log
 - **An allowlisted peer is trusted.** It can write any state key, take a lease
   you hold, and read everything you sync. The allowlist is the boundary — pair
   with people, not with topics you found somewhere.
+- **The backlog is the one namespace that is not owner-bound.** Any allowlisted
+  peer may create, complete, requeue or cancel **any** task — that is what a
+  shared backlog is, and a peer that could not finish work it did not create
+  could not be delegated to. So an allowlisted peer can mark your work `done`
+  with a fabricated `result`, or `cancelled` so nobody picks it up. This widens
+  what a peer *inside* the allowlist can do, not who is inside it. `createdBy` is
+  peer-chosen and is not an identity; the signature on the operation is. Merge is
+  monotone, so the destructive direction is one-way: a peer can end a task, not
+  silently reopen one.
+- **Task titles, details and results are peer-authored instructions.** This is
+  the highest-risk instance of "peer text is data": the payload literally *is* an
+  instruction — from another agent, not from your operator. Every task-bearing
+  tool result says so, and every string reaching the Markdown board is sanitized
+  so a title cannot forge a table row or a section heading.
 - **`outbox.json` holds message text on disk** (0600, inside the 0700 config
   directory). Message history is only replayed to peers you have paired with.
 - **Peers do relay for each other**, inside the handshake snapshot. Every

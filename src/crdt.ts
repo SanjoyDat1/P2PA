@@ -38,6 +38,15 @@ import {
   nextGeneration,
   type ClaimEntry,
 } from "./claim.js";
+import {
+  canonicalTask,
+  isAcceptableTaskEntry,
+  isTaskCollectable,
+  isTaskKey,
+  mergeTasks,
+  type TaskDraft,
+  type TaskEntry,
+} from "./task.js";
 import type { ContextState, JsonValue } from "./types.js";
 
 /** Maximum distinct keys in one document. */
@@ -49,6 +58,16 @@ export const MAX_CRDT_KEYS = 10_000;
  * shared context — and bounded, because leases were previously exempt entirely.
  */
 export const MAX_CLAIM_KEYS = 1_000;
+/**
+ * Maximum tasks on the backlog.
+ *
+ * Its own budget, like leases, so a flood of tasks cannot crowd out the shared
+ * context. 500 because a backlog is a human-scale queue — past a few hundred
+ * open items the board is no longer legible to the human it exists for — and
+ * because 500 entries at `MAX_VALUE_BYTES` is 32 MiB, an order of magnitude
+ * under what the state budget already tolerates.
+ */
+export const MAX_TASK_KEYS = 500;
 /** Maximum live elements in one set. */
 export const MAX_SET_ELEMENTS = 5_000;
 /** Maximum retained remove-tags in one set. */
@@ -99,7 +118,7 @@ export interface OrSetEntry extends SignatureFields {
   removes: string[];
 }
 
-export type CrdtEntry = LwwEntry | OrSetEntry | ClaimEntry;
+export type CrdtEntry = LwwEntry | OrSetEntry | ClaimEntry | TaskEntry;
 
 /** One key's state, as it travels on the wire and in snapshots. */
 export interface CrdtOp {
@@ -126,6 +145,10 @@ function isClaim(entry: CrdtEntry): entry is ClaimEntry {
   return entry.kind === "claim";
 }
 
+function isTask(entry: CrdtEntry): entry is TaskEntry {
+  return entry.kind === "task";
+}
+
 /**
  * Does `candidate` replace `current`?
  *
@@ -149,8 +172,10 @@ function entryWins(candidate: CrdtEntry, current: CrdtEntry): boolean {
 
 /** Highest lww stamp either side has seen for this key. Monotone, so it converges. */
 function highestFloor(a: CrdtEntry, b: CrdtEntry): Hlc | undefined {
-  const left = isOrSet(a) ? a.floor : isClaim(a) ? undefined : a.hlc;
-  const right = isOrSet(b) ? b.floor : isClaim(b) ? undefined : b.hlc;
+  // A lease or a task stamp is not evidence that a key was ever an `lww`
+  // register, so neither contributes a floor.
+  const left = isOrSet(a) ? a.floor : isClaim(a) || isTask(a) ? undefined : a.hlc;
+  const right = isOrSet(b) ? b.floor : isClaim(b) || isTask(b) ? undefined : b.hlc;
   if (!left) return right;
   if (!right) return left;
   return compareHlc(left, right) >= 0 ? left : right;
@@ -206,6 +231,13 @@ function mergeAdds(
 function canonicalEntry(entry: CrdtEntry): string {
   if (isClaim(entry)) {
     return `claim:${entry.gen}:${entry.ttl}:${entry.released === true ? "r" : "a"}`;
+  }
+  // Unreachable in practice — namespace isolation keeps other kinds off `@task/`
+  // keys and the task branch in `mergeOp` runs before `entryWins` is ever
+  // reached — but leaving a kind out of a function that claims to be a total
+  // ordering is exactly how the mixed-kind data loss in §5.5 became possible.
+  if (isTask(entry)) {
+    return `task:${entry.status}:${entry.attempts}:${canonicalTask(entry)}`;
   }
   return isOrSet(entry)
     ? `orset:${canonicalJson(entry.adds as JsonValue)}:${[...entry.removes].sort().join(",")}`
@@ -266,11 +298,20 @@ export class CrdtDoc {
     return count;
   }
 
+  /** Tasks on record, which have their own budget. */
+  private taskKeyCount(): number {
+    let count = 0;
+    for (const entry of this.entries.values()) {
+      if (isTask(entry)) count += 1;
+    }
+    return count;
+  }
+
   /** Keys that currently hold a value — tombstones do not consume the budget. */
   private liveKeyCount(): number {
     let live = 0;
     for (const entry of this.entries.values()) {
-      if (isClaim(entry)) continue;
+      if (isClaim(entry) || isTask(entry)) continue;
       if (!isOrSet(entry) && entry.deleted === true) continue;
       live += 1;
     }
@@ -290,6 +331,12 @@ export class CrdtDoc {
         // An expired lease is kept a while so a late op cannot reinstate it,
         // then dropped so finished tasks do not accumulate forever.
         if (isCollectable(entry, now)) this.entries.delete(key);
+        continue;
+      }
+      if (isTask(entry)) {
+        // Only a settled task is collectable. An `open` one is the work queue,
+        // and dropping it loses the job rather than the record of one.
+        if (isTaskCollectable(entry, now)) this.entries.delete(key);
         continue;
       }
       if (isOrSet(entry) || entry.deleted !== true) continue;
@@ -478,6 +525,60 @@ export class CrdtDoc {
     return op;
   }
 
+  /** Read the task at a key, if any. */
+  taskEntry(key: string): TaskEntry | undefined {
+    const entry = this.entries.get(key);
+    return entry && isTask(entry) ? entry : undefined;
+  }
+
+  /** Every task on record, settled ones included. */
+  taskEntries(): Array<{ key: string; entry: TaskEntry }> {
+    const out: Array<{ key: string; entry: TaskEntry }> = [];
+    for (const [key, entry] of this.entries) {
+      if (isTask(entry)) out.push({ key, entry: structuredClone(entry) });
+    }
+    return out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  }
+
+  /**
+   * Write a task locally.
+   *
+   * The draft is merged with what is already on record rather than replacing it,
+   * so a local write can never regress a field it did not mean to touch — a
+   * completion written from a stale read cannot lower an `attempts` a peer has
+   * already raised, or drop a dependency a peer added while we were deciding.
+   * `clock.tick()` is strictly greater than every stamp this replica has
+   * observed, so the fresh entry always wins the descriptor and the merged
+   * result always carries this node's stamp, which is what lets `signed()`
+   * sign it.
+   *
+   * Returns `null` when the merge rule would discard the write — the same guard
+   * `takeClaim` makes, and for the same reason: reporting a change every peer
+   * says did not happen is worse than reporting failure.
+   */
+  writeTask(key: string, draft: TaskDraft, now: number = Date.now()): CrdtOp | null {
+    const current = this.taskEntry(key);
+    if (!this.entries.has(key)) {
+      // Collected against the caller's clock rather than wall time, because
+      // retention here is measured against the same stamps this replica writes:
+      // a store driven by an injected clock would otherwise decide a task it
+      // stamped seconds ago had been settled for a week.
+      this.collectTombstones(now);
+      if (this.taskKeyCount() >= MAX_TASK_KEYS) {
+        throw new Error(
+          `backlog is at its ${MAX_TASK_KEYS}-task limit; complete_task or ` +
+            `fail_task on finished work frees a slot`,
+        );
+      }
+    }
+    const fresh: TaskEntry = { kind: "task", hlc: this.clock.tick(), ...draft };
+    const merged = current ? mergeTasks(current, fresh) : fresh;
+    if (current && canonicalTask(merged) === canonicalTask(current)) return null;
+    const op = this.signed({ key, entry: merged });
+    this.entries.set(key, op.entry);
+    return op;
+  }
+
   // ---- merge --------------------------------------------------------------
 
   /**
@@ -513,6 +614,18 @@ export class CrdtDoc {
     ) {
       return { key, status: "rejected", reason: "lease bounds exceeded" };
     }
+    if (isTaskKey(key) !== isTask(entry)) {
+      return {
+        key,
+        status: "rejected",
+        reason: isTask(entry)
+          ? "task entry outside the task namespace"
+          : "state entry inside the task namespace",
+      };
+    }
+    if (isTask(entry) && !isAcceptableTaskEntry(entry, now)) {
+      return { key, status: "rejected", reason: "task bounds exceeded" };
+    }
     if (JSON.stringify(entry).length > MAX_VALUE_BYTES) {
       return { key, status: "rejected", reason: "entry exceeds value size limit" };
     }
@@ -529,6 +642,10 @@ export class CrdtDoc {
       if (isClaim(entry)) {
         if (this.claimKeyCount() >= MAX_CLAIM_KEYS) {
           return { key, status: "rejected", reason: "lease limit reached" };
+        }
+      } else if (isTask(entry)) {
+        if (this.taskKeyCount() >= MAX_TASK_KEYS) {
+          return { key, status: "rejected", reason: "task limit reached" };
         }
       } else if (this.liveKeyCount() >= MAX_CRDT_KEYS) {
         return { key, status: "rejected", reason: "document key limit reached" };
@@ -548,6 +665,24 @@ export class CrdtDoc {
         return previous !== entry.hlc.n
           ? { key, status: "contended", previousNode: previous }
           : { key, status: "applied" };
+      }
+      this.entries.set(key, entry);
+      return { key, status: "applied" };
+    }
+
+    // A backlog entry is expected to be written by several nodes — that is what
+    // a shared backlog means — so it merges field by field rather than picking a
+    // winner, and it is never reported as "contended". Surfacing every peer
+    // completion as a concurrent update would fill the human's Concurrent
+    // Updates section with ordinary traffic and teach the agent to ignore it.
+    if (isTask(entry)) {
+      if (current && isTask(current)) {
+        const merged = mergeTasks(current, entry);
+        if (canonicalTask(merged) === canonicalTask(current)) {
+          return { key, status: "ignored" };
+        }
+        this.entries.set(key, merged);
+        return { key, status: "applied" };
       }
       this.entries.set(key, entry);
       return { key, status: "applied" };
@@ -687,7 +822,10 @@ export class CrdtDoc {
         out[key] = tags.map((tag) => entry.adds[tag] as JsonValue);
         continue;
       }
-      if (isClaim(entry)) continue;
+      // Leases and tasks each have their own tools and their own digest, and
+      // leaking `@task/…` keys here would put peer-authored titles into a
+      // surface with no provenance framing.
+      if (isClaim(entry) || isTask(entry)) continue;
       if (entry.deleted === true) continue;
       out[key] = entry.value as JsonValue;
     }
@@ -696,7 +834,7 @@ export class CrdtDoc {
 
   get(key: string): JsonValue | undefined {
     const entry = this.entries.get(key);
-    if (!entry || isClaim(entry)) return undefined;
+    if (!entry || isClaim(entry) || isTask(entry)) return undefined;
     if (isOrSet(entry)) {
       const removed = new Set(entry.removes);
       return Object.keys(entry.adds)
@@ -722,10 +860,14 @@ export class CrdtDoc {
   /** Replace all entries, e.g. when rehydrating from disk. */
   load(ops: CrdtOp[], now: number): void {
     this.entries.clear();
-    // State first: leases are transient and sort ahead of ordinary keys, so a
-    // key-ordered truncation would drop the user's actual context to keep them.
+    // State first, then the backlog, then leases: all three sort ahead of
+    // ordinary keys, so a key-ordered truncation would drop the user's actual
+    // context to keep them. Tasks outrank leases in what survives an over-budget
+    // document because a lease is transient and re-derivable by expiry, while a
+    // task is the work itself.
     const ordered = [
-      ...ops.filter((op) => !isClaim(op.entry)),
+      ...ops.filter((op) => !isClaim(op.entry) && !isTask(op.entry)),
+      ...ops.filter((op) => isTask(op.entry)),
       ...ops.filter((op) => isClaim(op.entry)),
     ];
     for (const op of ordered) {
@@ -735,6 +877,8 @@ export class CrdtDoc {
       if (verifyOp(op).status === "invalid") continue;
       if (isClaim(op.entry)) {
         if (this.claimKeyCount() >= MAX_CLAIM_KEYS) continue;
+      } else if (isTask(op.entry)) {
+        if (this.taskKeyCount() >= MAX_TASK_KEYS) continue;
       } else if (this.liveKeyCount() >= MAX_CRDT_KEYS) {
         continue;
       }
@@ -753,6 +897,25 @@ export class CrdtDoc {
     const rows = this.claimEntries().map(
       ({ key, entry }) =>
         `${key}|${entry.gen}|${entry.hlc.w}|${entry.hlc.c}|${entry.hlc.n}|${entry.ttl}|${entry.released === true ? 1 : 0}`,
+    );
+    return createHash("sha256").update(rows.join("\n")).digest("hex").slice(0, 16);
+  }
+
+  /**
+   * Digest over the backlog, which `stateHash` also excludes.
+   *
+   * Empty when there are no tasks, rather than the hash of an empty string: a
+   * peer that predates this namespace sends no `tasks` digest at all, and the
+   * two have to compare equal or every reconnect in a mixed swarm re-ships the
+   * whole document to prove nothing changed.
+   */
+  tasksHash(): string {
+    const entries = this.taskEntries();
+    if (entries.length === 0) return "";
+    const rows = entries.map(
+      ({ key, entry }) =>
+        `${key}|${entry.status}|${entry.attempts}|${entry.priority}|` +
+        `${entry.hlc.w}|${entry.hlc.c}|${entry.hlc.n}`,
     );
     return createHash("sha256").update(rows.join("\n")).digest("hex").slice(0, 16);
   }

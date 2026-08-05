@@ -17,6 +17,7 @@ import { canonicalJson } from "../src/canonical.js";
 import { signableBytes } from "../src/signing.js";
 import { compareHlc } from "../src/hlc.js";
 import { claimWins, type ClaimEntry } from "../src/claim.js";
+import { mergeTasks, type TaskEntry, type TaskStatus } from "../src/task.js";
 import { negotiate } from "../src/protocol.js";
 import type { Hlc } from "../src/hlc.js";
 
@@ -140,6 +141,84 @@ describe("SPEC §11.4 — lease merge", () => {
   it("is idempotent", () => {
     const entry = claim(1, 300, "bbbb");
     assert.equal(claimWins(entry, { ...entry }), false);
+  });
+});
+
+describe("SPEC §11.6 — task merge", () => {
+  const task = (
+    overrides: Partial<TaskEntry> & { w?: number; n?: string } = {},
+  ): TaskEntry => {
+    const { w = 100, n = "aaaa", ...rest } = overrides;
+    return {
+      kind: "task",
+      hlc: { w, c: 0, n },
+      title: "X",
+      priority: 5,
+      status: "open",
+      attempts: 0,
+      createdBy: "aaaa",
+      createdAt: 50,
+      ...rest,
+    };
+  };
+
+  const statusVectors: Array<[TaskStatus, TaskStatus, TaskStatus]> = [
+    ["open", "done", "done"],
+    ["failed", "cancelled", "failed"],
+    ["done", "cancelled", "done"],
+    ["done", "failed", "done"],
+  ];
+
+  for (const [left, right, expected] of statusVectors) {
+    it(`joins ${left} with ${right} as ${expected}`, () => {
+      assert.equal(mergeTasks(task({ status: left }), task({ status: right })).status, expected);
+      assert.equal(mergeTasks(task({ status: right }), task({ status: left })).status, expected);
+    });
+  }
+
+  it("joins attempts 2 and 5 as 5", () => {
+    assert.equal(mergeTasks(task({ attempts: 2 }), task({ attempts: 5 })).attempts, 5);
+  });
+
+  it('joins deps ["a"] and ["b"] as ["a","b"], sorted', () => {
+    assert.deepEqual(
+      mergeTasks(task({ deps: ["a"] }), task({ deps: ["b"] })).deps,
+      ["a", "b"],
+    );
+    assert.deepEqual(
+      mergeTasks(task({ deps: ["b"] }), task({ deps: ["a"] })).deps,
+      ["a", "b"],
+    );
+  });
+
+  it("takes the descriptor whole from the greater stamp", () => {
+    const merged = mergeTasks(
+      task({ w: 100, n: "aaaa", title: "X", priority: 5 }),
+      task({ w: 200, n: "bbbb", title: "Y", priority: 1 }),
+    );
+    assert.equal(merged.title, "Y");
+    assert.equal(merged.priority, 1);
+    assert.equal(merged.hlc.w, 200);
+    assert.equal(merged.hlc.n, "bbbb");
+  });
+
+  it("keeps the later result", () => {
+    assert.equal(
+      mergeTasks(
+        task({ w: 100, result: "early", status: "done" }),
+        task({ w: 200, n: "bbbb", result: "late", status: "done" }),
+      ).result,
+      "late",
+    );
+  });
+
+  it("is idempotent, signature included", () => {
+    const signed: TaskEntry = {
+      ...task({ deps: ["a"], attempts: 2 }),
+      by: "f".repeat(64),
+      sig: "A".repeat(88),
+    };
+    assert.deepEqual(mergeTasks(signed, { ...signed }), signed);
   });
 });
 

@@ -24,6 +24,18 @@ import {
   type AgentView,
 } from "./presence.js";
 import {
+  DEFAULT_TASK_PRIORITY,
+  describeTask,
+  isTaskKey,
+  isTerminal,
+  slugTaskId,
+  taskIdFromTaskKey,
+  taskKeyFor,
+  type TaskDraft,
+  type TaskEntry,
+  type TaskView,
+} from "./task.js";
+import {
   CrdtOpArraySchema,
   LEGACY_VERSION_KEY,
   isReservedKey,
@@ -203,6 +215,127 @@ export class ContextStore {
       .sort((a, b) => Number(b.held) - Number(a.held) || (a.taskId < b.taskId ? -1 : 1));
   }
 
+  // ---- backlog ------------------------------------------------------------
+
+  /** The task on record under an id, settled ones included. */
+  task(taskId: string): TaskEntry | undefined {
+    return this.doc.taskEntry(taskKeyFor(taskId));
+  }
+
+  /** Every task on record, keyed by id. */
+  taskEntries(): Array<{ taskId: string; entry: TaskEntry }> {
+    const out: Array<{ taskId: string; entry: TaskEntry }> = [];
+    for (const { key, entry } of this.doc.taskEntries()) {
+      const taskId = taskIdFromTaskKey(key);
+      if (taskId !== null) out.push({ taskId, entry });
+    }
+    return out;
+  }
+
+  /**
+   * Digest over the backlog.
+   *
+   * Separate from `stateHash` and `claimsHash` for the same reason those are
+   * separate from each other: two replicas that disagree about what work exists
+   * would otherwise look identical to `sync_health`.
+   */
+  tasksHash(): string {
+    return this.doc.tasksHash();
+  }
+
+  /**
+   * Put a task on the backlog.
+   *
+   * Create is not an overwrite path. A duplicate id is refused rather than
+   * merged, because the caller asking to create a task it has already created is
+   * a caller that has lost track of what it did — silently rewriting the
+   * descriptor of somebody's in-flight work is the worse answer.
+   */
+  createTask(input: {
+    title: string;
+    detail?: string;
+    needs?: string[];
+    deps?: string[];
+    priority?: number;
+    taskId?: string;
+    suffix: string;
+    now?: number;
+  }): { ok: true; taskId: string; op: CrdtOp } | { ok: false; error: string } {
+    const taskId = input.taskId ?? slugTaskId(input.title, input.suffix);
+    if (!isValidTaskId(taskId)) {
+      return { ok: false, error: `Malformed task id: ${taskId}` };
+    }
+    if (this.task(taskId) !== undefined) {
+      return {
+        ok: false,
+        error:
+          `A task with id "${taskId}" already exists. Omit task_id to have one ` +
+          `minted, or call list_tasks to see what is on the board.`,
+      };
+    }
+    const draft: TaskDraft = {
+      title: input.title,
+      ...(input.detail !== undefined ? { detail: input.detail } : {}),
+      ...(input.needs !== undefined ? { needs: input.needs } : {}),
+      ...(input.deps !== undefined ? { deps: input.deps } : {}),
+      priority: input.priority ?? DEFAULT_TASK_PRIORITY,
+      status: "open",
+      attempts: 0,
+      createdBy: this.nodeId,
+      createdAt: input.now ?? this.now(),
+    };
+    let op: CrdtOp | null;
+    try {
+      op = this.doc.writeTask(taskKeyFor(taskId), draft, this.now());
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    // Only reachable if the merge rule discarded a write against an entry we
+    // just established does not exist, which nothing can currently produce —
+    // reported rather than asserted, because "created" must mean created.
+    if (!op) return { ok: false, error: `Could not record task "${taskId}"` };
+    return { ok: true, taskId, op };
+  }
+
+  /** Change a task that already exists. Returns null when nothing moved. */
+  putTask(taskId: string, draft: TaskDraft): CrdtOp | null {
+    if (!isValidTaskId(taskId)) throw new Error(`Malformed task id: ${taskId}`);
+    return this.doc.writeTask(taskKeyFor(taskId), draft, this.now());
+  }
+
+  /**
+   * The board: every task joined with its lease and with the roster.
+   *
+   * The join happens on read and only on read. A task never records who is
+   * working on it — `holder` here comes from `@claim/<id>`, and `holderLive`
+   * from `@agent/<holder>`.
+   */
+  listTasks(now: number = this.now()): TaskView[] {
+    const tasks = this.taskEntries();
+    const byId = new Map(tasks.map(({ taskId, entry }) => [taskId, entry]));
+    const agents = new Map(
+      this.listAgents(now).map((agent) => [
+        agent.nodeId,
+        { role: agent.role, live: agent.live },
+      ]),
+    );
+    const capabilities = new Set(this.ownCard()?.capabilities ?? []);
+    return tasks
+      .map(({ taskId, entry }) =>
+        describeTask(taskId, entry, this.claim(taskId), byId, now, {
+          selfNodeId: this.nodeId,
+          capabilities,
+          agents,
+        }),
+      )
+      .sort(
+        (a, b) =>
+          Number(isTerminal(a.status)) - Number(isTerminal(b.status)) ||
+          b.priority - a.priority ||
+          (a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0),
+      );
+  }
+
   /** Merge inbound ops from a peer. Never replaces the document wholesale. */
   merge(ops: CrdtOp[], now: number = this.now()): MergeResult[] {
     return this.doc.mergeAll(ops, now);
@@ -302,7 +435,7 @@ export class ContextStore {
     let seeded = 0;
     for (const [key, value] of Object.entries(state)) {
       if (isReservedKey(key) || key === LEGACY_VERSION_KEY) continue;
-      if (isClaimKey(key)) continue;
+      if (isClaimKey(key) || isTaskKey(key)) continue;
       // Re-stamping somebody else's card under this node's id would forge it.
       if (isAgentKey(key)) continue;
       this.doc.setValue(key, value);
@@ -318,6 +451,11 @@ export class ContextStore {
     if (isClaimKey(key)) {
       throw new Error(
         `Key "${key}" belongs to the lease namespace; use claim/release instead`,
+      );
+    }
+    if (isTaskKey(key)) {
+      throw new Error(
+        `Key "${key}" belongs to the task namespace; use create_task / complete_task instead`,
       );
     }
     if (isAgentKey(key)) {
