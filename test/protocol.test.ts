@@ -28,6 +28,7 @@ import { chunkSnapshot, SNAPSHOT_PART_BUDGET } from "../src/p2p.js";
 import {
   CAP_PRESENCE,
   CAP_SIGNATURES,
+  CAP_TASKS,
   LOCAL_PROFILE,
   MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
@@ -164,11 +165,40 @@ describe("version negotiation", () => {
     }
   });
 
-  it("skips the handshake snapshot when both replicas already match", () => {
-    const digest = { state: "abc123", claims: "def456" };
+  it("intersects the task capability like any other", () => {
+    const shared = negotiate({ min: 4, max: 4, node: "peer", caps: [CAP_TASKS] });
+    assert.equal(shared.ok, true);
+    if (shared.ok) assert.equal(shared.caps.has(CAP_TASKS), true);
+
+    // A peer on 0.8.0 advertises the other four and never this one, which is
+    // exactly what the outbound task filter keys off.
+    const older = negotiate({
+      min: 4,
+      max: 4,
+      node: "peer",
+      caps: ["sig", "chunk", "addr", "presence"],
+    });
+    assert.equal(older.ok, true);
+    if (older.ok) {
+      assert.equal(older.caps.has(CAP_TASKS), false);
+      assert.equal(older.caps.size, 4, "everything else still negotiates");
+    }
+  });
+
+  it("skips the handshake snapshot when all three digests already match", () => {
+    const digest = { state: "abc123", claims: "def456", tasks: "0011223344556677" };
     assert.equal(digestsMatch(digest, { ...digest }), true);
-    assert.equal(digestsMatch(digest, { state: "abc123", claims: "other" }), false);
+    assert.equal(digestsMatch(digest, { ...digest, state: "other" }), false);
+    assert.equal(digestsMatch(digest, { ...digest, claims: "other" }), false);
+    assert.equal(digestsMatch(digest, { ...digest, tasks: "other" }), false);
     assert.equal(digestsMatch(digest, undefined), false);
+
+    // A peer that predates the backlog sends a two-field digest. Treating the
+    // missing field as "" is what keeps the optimisation alive in a mixed
+    // swarm — but only when this node's backlog is genuinely empty.
+    const empty = { state: "abc123", claims: "def456", tasks: "" };
+    assert.equal(digestsMatch(empty, { state: "abc123", claims: "def456" }), true);
+    assert.equal(digestsMatch(digest, { state: "abc123", claims: "def456" }), false);
   });
 });
 

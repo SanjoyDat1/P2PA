@@ -27,12 +27,29 @@ export const DEFAULT_WAIT_MS = 30_000;
 /** Message text carried inline. The full text is always in the audit trail. */
 export const MAX_EVENT_TEXT = 2_000;
 
+/**
+ * The per-kind meaning of `text` is documented here rather than by adding three
+ * near-identical optional fields to `PeerEvent`. `taskId`, `holder`, `status`
+ * and `text` already carry everything a task event needs, and `text` is already
+ * truncated to `MAX_EVENT_TEXT` — which is what bounds a peer-supplied title or
+ * result on this path.
+ */
 export type PeerEventKind =
   | "state"
   | "message"
   | "claim"
   | "release"
-  | "presence";
+  | "presence"
+  /** A task was created, or an open task changed (including a requeue). `text` is the title. */
+  | "task"
+  /** A task reached `done`. `text` carries the result, truncated. */
+  | "task_done"
+  /** A task reached `failed` or `cancelled`. `text` carries the reason. */
+  | "task_failed"
+  /** A task this node could not run became runnable. `text` names the dep that cleared. */
+  | "task_ready"
+  /** An open task's lease lapsed with nothing recorded. `holder` is who dropped it. */
+  | "task_abandoned";
 
 export interface PeerEvent {
   /** Monotonic cursor. Pass the highest seen back as `since` to avoid gaps. */

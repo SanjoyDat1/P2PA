@@ -43,11 +43,24 @@ export const CAP_CHUNKED_SNAPSHOT = "chunk";
 export const CAP_ADDRESSED_MESSAGES = "addr";
 export const CAP_PRESENCE = "presence";
 
+/**
+ * Understands the `@task/` namespace.
+ *
+ * Unlike the other four, gating on this one is not an optimisation. §4.1 tells a
+ * receiver to ignore a frame that fails schema validation, and entries are
+ * validated as a *discriminated union* — an unknown `kind` is not an unknown
+ * field, so one task op makes a peer that predates this namespace discard the
+ * entire frame carrying it. Sending a snapshot unfiltered to such a peer hands
+ * it nothing at all: not a degraded sync, no sync. See §14.
+ */
+export const CAP_TASKS = "task";
+
 export const LOCAL_CAPABILITIES: readonly string[] = [
   CAP_SIGNATURES,
   CAP_CHUNKED_SNAPSHOT,
   CAP_ADDRESSED_MESSAGES,
   CAP_PRESENCE,
+  CAP_TASKS,
 ];
 
 /** Max capability tokens accepted in a hello, so the list cannot be a payload. */
@@ -76,6 +89,14 @@ export interface StateDigest {
   state: string;
   /** `claimsHash()` — leases are excluded from the state digest. */
   claims: string;
+  /**
+   * `tasksHash()` — the backlog is excluded from both of the above.
+   *
+   * Optional because a peer that predates the `@task/` namespace sends no such
+   * field, and empty for an empty backlog, so two nodes with no tasks still
+   * match across that boundary and keep the skip-the-snapshot optimisation.
+   */
+  tasks?: string;
 }
 
 /** The opening frame's body, as advertised by a peer. */
@@ -187,5 +208,9 @@ export function digestsMatch(
   remote: StateDigest | undefined,
 ): boolean {
   if (!remote) return false;
-  return local.state === remote.state && local.claims === remote.claims;
+  return (
+    local.state === remote.state &&
+    local.claims === remote.claims &&
+    (local.tasks ?? "") === (remote.tasks ?? "")
+  );
 }

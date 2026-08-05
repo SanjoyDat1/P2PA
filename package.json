@@ -1,6 +1,6 @@
 {
   "name": "p2pa",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "P2PA \u2014 headless peer-to-peer context synchronization, work leases, and messaging for local AI agents (MCP + Hyperswarm + per-key CRDT)",
   "license": "MIT",
   "type": "module",

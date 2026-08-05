@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import type { CrdtOp } from "./crdt.js";
 import { sanitizeLabel } from "./peer-key.js";
 import type { ClaimView } from "./claim.js";
+import type { TaskView } from "./task.js";
 import type {
   AuditEntry,
   AuditPeer,
@@ -48,10 +49,21 @@ export const MAX_AUDIT_BYTES = 256 * 1024;
 /** Message text kept in an audit entry. The full text stays in the outbox log. */
 export const MAX_AUDIT_TEXT = 4_000;
 
+/**
+ * Rows rendered in the backlog table.
+ *
+ * The file is re-rendered whole on every mutation, so an unbounded table makes
+ * every write proportional to the entire backlog — the same reasoning that
+ * bounds the audit section. The trailing count line is always rendered, so a
+ * reader can never mistake a truncated board for the whole one.
+ */
+export const MAX_BACKLOG_ROWS = 200;
+
 const TITLE = "# P2PA Shared Context";
 const ACTIVE_HEADING = "## Active State";
 const REPLICA_HEADING = "## Replica State";
 const CLAIMS_HEADING = "## Claims";
+const BACKLOG_HEADING = "## Backlog";
 const CONFLICTS_HEADING = "## Concurrent Updates";
 const AUDIT_HEADING = "## Audit Trail";
 
@@ -59,6 +71,8 @@ const AUDIT_HEADING = "## Audit Trail";
  * Sectioned Markdown persistence:
  * - ## Active State       — plain JSON view, for humans and for `git diff`
  * - ## Replica State      — the same document plus per-key CRDT stamps
+ * - ## Claims             — live leases, rewritten from the CRDT document
+ * - ## Backlog            — the task board, rewritten from the CRDT document
  * - ## Concurrent Updates — rewritten from the in-memory contention log
  * - ## Audit Trail        — append-only update / message / override history
  *
@@ -212,6 +226,14 @@ export class MarkdownLog {
     atomicWrite(this.filePath, renderDoc(parts));
   }
 
+  /** Rewrite ## Backlog from the task board (omit the section when empty). */
+  rewriteBacklog(views: TaskView[]): void {
+    this.ensureInitialized();
+    const parts = readParts(readFileSync(this.filePath, "utf8"));
+    parts.backlog = formatBacklog(views).trim();
+    atomicWrite(this.filePath, renderDoc(parts));
+  }
+
   /** Rewrite ## Concurrent Updates (omit the section when empty). */
   rewriteContention(items: ContentionItem[]): void {
     this.ensureInitialized();
@@ -284,6 +306,7 @@ function buildSkeleton(state: ContextState): string {
     active: jsonBlock(state),
     replica: replicaBlock([]),
     claims: "",
+    backlog: "",
     contention: "",
     audit: "",
   });
@@ -312,6 +335,38 @@ function formatClaims(views: ClaimView[]): string {
       `${safe(view.expiresAt)} | ${view.note ? safe(view.note) : "—"} |\n`;
   }
   return body;
+}
+
+/**
+ * The board a human reads.
+ *
+ * Every interpolated string — task id, title, capability tokens, dependency ids,
+ * holder — is peer-authored and goes through `safe()`, which strips `|`,
+ * backticks, `#`, brackets and control characters. Without it a title can forge
+ * a table row, or open a `##` heading that the section parser then reads as a
+ * boundary and silently truncates the file's history at.
+ */
+function formatBacklog(views: TaskView[]): string {
+  if (views.length === 0) return "";
+  const shown = views.slice(0, MAX_BACKLOG_ROWS);
+  let body =
+    "| Task | Status | Pri | Needs | Waiting on | Holder | Title |\n" +
+    "| --- | --- | --- | --- | --- | --- | --- |\n";
+  for (const view of shown) {
+    const needs =
+      view.needs.length > 0
+        ? view.needs.map((need) => `\`${safe(need)}\``).join(" ")
+        : "—";
+    const waiting =
+      view.blockedBy.length > 0
+        ? view.blockedBy.map((dep) => `\`${safe(dep)}\``).join(" ")
+        : "—";
+    const holder = view.holder === null ? "—" : `\`${safe(view.holder)}\``;
+    body +=
+      `| \`${safe(view.taskId)}\` | ${safe(view.status)} | ${view.priority} | ` +
+      `${needs} | ${waiting} | ${holder} | ${safe(view.title)} |\n`;
+  }
+  return `${body}\nshowing ${shown.length} of ${views.length} tasks\n`;
 }
 
 function formatContentionItems(items: ContentionItem[]): string {
@@ -359,6 +414,7 @@ const SECTION_HEADINGS = [
   ACTIVE_HEADING,
   REPLICA_HEADING,
   CLAIMS_HEADING,
+  BACKLOG_HEADING,
   CONFLICTS_HEADING,
   AUDIT_HEADING,
 ] as const;
@@ -392,15 +448,22 @@ interface DocParts {
   active: string;
   replica: string;
   claims: string;
+  backlog: string;
   contention: string;
   audit: string;
 }
 
+/**
+ * A file written before the backlog existed simply has no `## Backlog` heading,
+ * so it reads as `""` and the section is omitted until there is something to put
+ * in it. `sliceSection` is heading-order-independent, so nothing needs migrating.
+ */
 function readParts(content: string): DocParts {
   return {
     active: sliceSection(content, ACTIVE_HEADING)?.trim() ?? jsonBlock({}),
     replica: sliceSection(content, REPLICA_HEADING)?.trim() ?? replicaBlock([]),
     claims: sliceSection(content, CLAIMS_HEADING)?.trim() ?? "",
+    backlog: sliceSection(content, BACKLOG_HEADING)?.trim() ?? "",
     contention: sliceSection(content, CONFLICTS_HEADING)?.trim() ?? "",
     audit: sliceSection(content, AUDIT_HEADING)?.trim() ?? "",
   };
@@ -412,6 +475,9 @@ function renderDoc(parts: DocParts): string {
   out += `${REPLICA_HEADING}\n${parts.replica}\n\n`;
   if (parts.claims.length > 0) {
     out += `${CLAIMS_HEADING}\n\n${parts.claims}\n\n`;
+  }
+  if (parts.backlog.length > 0) {
+    out += `${BACKLOG_HEADING}\n\n${parts.backlog}\n\n`;
   }
   if (parts.contention.length > 0) {
     out += `${CONFLICTS_HEADING}\n\n${parts.contention}\n\n`;
@@ -534,6 +600,34 @@ function renderAuditEntry(entry: AuditEntry): string {
       `- **Task:** \`${safe(entry.taskId)}\`\n` +
       `- **Holder:** \`${safe(entry.holder)}\` (generation ${entry.generation})\n`
     );
+  }
+
+  if (entry.action === "Task Created") {
+    const needs =
+      entry.needs.length > 0
+        ? entry.needs.map((need) => `\`${safe(need)}\``).join(", ")
+        : "(none)";
+    const deps =
+      entry.deps.length > 0
+        ? entry.deps.map((dep) => `\`${safe(dep)}\``).join(", ")
+        : "(none)";
+    return (
+      `${head} - [ACTION: Task Created]\n` +
+      `- **Task:** \`${safe(entry.taskId)}\`\n` +
+      `- **Title:** ${safe(entry.title)}\n` +
+      `- **Priority:** ${entry.priority} · **Needs:** ${needs} · **Waiting on:** ${deps}\n`
+    );
+  }
+  if (entry.action === "Task Settled") {
+    let block = `${head} - [ACTION: Task Settled]\n`;
+    for (const task of entry.tasks) {
+      block +=
+        `- **Task:** \`${safe(task.taskId)}\`\n` +
+        `- **Outcome:** ${safe(task.status)} (attempt ${task.attempt})\n` +
+        `- **Settled by:** \`${safe(task.settledBy)}\`\n` +
+        (task.detail !== undefined ? `- **Detail:** ${safe(task.detail)}\n` : "");
+    }
+    return block;
   }
 
   let block = `${head} - [ACTION: Message]\n- **Content:**\n`;

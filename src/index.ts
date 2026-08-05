@@ -31,6 +31,7 @@ import { MarkdownLog } from "./markdown-log.js";
 import { P2PNode, describePeer, type PeerIdentity } from "./p2p.js";
 import { ContentionLog } from "./conflicts.js";
 import { EventBus } from "./events.js";
+import { AbandonedTasks } from "./task.js";
 import { acquireLock, releaseLock, STATE_WRITER_LOCK } from "./lock.js";
 import { Outbox } from "./outbox.js";
 import { createMcpServer, startMcpServer } from "./mcp-server.js";
@@ -274,7 +275,11 @@ async function main(): Promise<void> {
     getActiveState: () => store.export(),
     // Advertised in `hello`, so two peers already holding the same document skip
     // the handshake snapshot instead of re-shipping it on every reconnect.
-    getDigest: () => ({ state: store.stateHash(), claims: store.claimsHash() }),
+    getDigest: () => ({
+      state: store.stateHash(),
+      claims: store.claimsHash(),
+      tasks: store.tasksHash(),
+    }),
     label: identity.label,
     onPeerConnect: (peer: PeerIdentity) => {
       if (peer.pubkey === null) return;
@@ -352,6 +357,9 @@ async function main(): Promise<void> {
     contention,
     events,
     outbox,
+    // One instance for the process: the point of the set is that a lapsed lease
+    // is announced once, not once per call.
+    abandoned: new AbandonedTasks(),
     recipients: () => allowlist.keys(),
     doc: docBridge,
   });

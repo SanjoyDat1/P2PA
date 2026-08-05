@@ -180,6 +180,7 @@ addressed a message that the receiver treated as a broadcast.
 | `chunk` | Understands multi-part snapshots (`part`/`of`) (§6.6) |
 | `addr` | Understands addressed messages (`to`/`corr`/`intent`) (§8.4) |
 | `presence` | Understands the `@agent/` namespace (§8) |
+| `task` | Understands the `@task/` namespace (§7A). **Gating on this is mandatory, not an optimisation** — see §7A.7 |
 
 ---
 
@@ -295,16 +296,33 @@ local write unacceptable to every peer, silently removing the node from the swar
 
 See §7.
 
+#### 5.4.4 `task` — backlog entry
+
+See §7A.
+
+A `task` entry is collectable once it is **terminal** and `now - hlc.w` exceeds
+`TASK_RETENTION_MS` (7 days). An `open` task **MUST NOT** be collected however old
+it is: it is the work queue, and dropping it loses the job rather than the record
+of one.
+
+Retention **MUST** comfortably exceed the accepted clock skew (§5.3), or a settled
+task collected early is resurrected as `open` by an in-flight op that predates the
+completion and an agent redoes the work. A peer offline for longer than the
+retention window can still resurrect a settled task; this is the same limitation
+tombstones have (§5.4.1) and implementations **MUST NOT** present it as closed.
+
 ### 5.5 Merge
 
 For an inbound op on key `K` with entry `E`, against current entry `C`:
 
 1. **Stamp bounds** (§5.3).
 2. **Namespace check.** `claim` entries **MUST** appear only under `@claim/`, and
-   `@claim/` **MUST** hold only `claim` entries. The `@agent/` rule (§8.3) is
-   equivalent but is enforced at the validation boundary rather than in merge, so
-   it applies to the on-disk replica too.
-3. **Lease bounds** (§7.2, §7.5), when `E` is a `claim`.
+   `@claim/` **MUST** hold only `claim` entries. The same rule binds `task`
+   entries to `@task/` and `@task/` to `task` entries. The `@agent/` rule (§8.3)
+   is equivalent but is enforced at the validation boundary rather than in merge,
+   so it applies to the on-disk replica too.
+3. **Lease bounds** (§7.2, §7.5), when `E` is a `claim`; **task bounds** (§7A.2),
+   when `E` is a `task`.
 4. **Entry size** (§10.1).
 5. **Verify signature** if present (§6). An invalid signature **MUST** reject the
    op. Every cheaper check above **MUST** run first: verification is the most
@@ -316,6 +334,10 @@ For an inbound op on key `K` with entry `E`, against current entry `C`:
    local write.
 5. If `C` is absent, store `E`.
 6. If `E` and `C` are both `claim`, apply §7.3.
+6a. If `E` and `C` are both `task`, apply §7A.3. A task **MUST NOT** be reported
+   as contended: a backlog entry is expected to be written by several nodes, and
+   reporting every peer completion as a concurrent update fills the operator's
+   record with ordinary traffic.
 7. If `E` and `C` are both `orset`, **union**: `adds` merged, `removes` unioned,
    `floor` set to the higher of the two. A union **MUST** be applied even if `E` is
    older than `C` — *unless* `E.hlc` is at or below the floor, in which case `E`
@@ -369,6 +391,7 @@ Canonical **entry** encoding for tiebreaks, per kind — note that `by`, `sig` a
 | `lww` | `lww:-` when deleted, else `lww:` + canonicalJson(`value` ?? null) |
 | `orset` | `orset:` + canonicalJson(`adds`) + `:` + sorted `removes` joined by `,` |
 | `claim` | `claim:<gen>:<ttl>:<r\|a>` (`r` when released) |
+| `task` | `task:<status>:<attempts>:` + canonicalJson(entry minus `by`/`sig`) |
 
 Non-integer numbers **SHOULD NOT** be signed: their canonical rendering is
 implementation-sensitive across languages.
@@ -383,9 +406,26 @@ difference between an O(document) transfer per peer and nothing at all.
 |---|---|
 | `state` | First 16 hex characters of `SHA-256(canonicalJson(materialized document))`, where the materialized document is the plain-JSON view with tombstones, tags, leases and presence stripped (§5.5) |
 | `claims` | First 16 hex characters of `SHA-256` over the lease table: one line per lease, sorted by key, each `key\|gen\|w\|c\|n\|ttl\|released`, joined by `\n`, where `released` is `1` or `0` |
+| `tasks` | First 16 hex characters of `SHA-256` over the backlog: one line per task, sorted by key, each `key\|H`, where `H` is the first 16 hex characters of `SHA-256(canonical task content)` (§7A.3), joined by `\n`. **The empty string when there are no tasks** |
 
-Leases are digested separately because `state` deliberately excludes them: two
-replicas that disagree about who holds a task would otherwise look identical.
+Leases and tasks are digested separately because `state` deliberately excludes
+them: two replicas that disagree about who holds a task, or about what work
+exists, would otherwise look identical.
+
+A digest **MUST** cover the **whole mergeable content** of the entries it
+summarizes, never a projection of them. This is not thoroughness for its own
+sake. A digest match suppresses the handshake snapshot, so a field left out of a
+digest makes two replicas differing only in that field skip the one exchange that
+would reconcile them — and neither side then has any reason to send another op.
+The divergence is permanent, and it is reported as agreement. It is reachable
+with no attacker: two nodes creating the same task id concurrently, one ending up
+with a dependency the other lacks and both agreeing on every other field.
+
+`tasks` is OPTIONAL, and a receiver **MUST** treat an absent `tasks` as `""`. A
+sender with no tasks **MUST** send `""` rather than the hash of an empty input, so
+that a peer predating the namespace — which sends no such field — still matches a
+peer that has no tasks. Without this rule every reconnect in a mixed swarm
+re-ships the whole document to prove nothing changed.
 
 An implementation **MUST** treat a digest as a hint only. Skipping the snapshot on
 a match is an optimisation; a mismatch — including one caused by a peer that
@@ -490,6 +530,15 @@ for it. Set *deltas* are signed, so membership is verifiable; the merged
 aggregate is not. `lww` writes and leases are whole-value writes and remain
 end-to-end verifiable after any number of relays.
 
+The same applies to a **merged `task` entry** (§7A.3): once a join has combined
+fields from two authors, no single signature covers the result, so it is stored
+and relayed unsigned. Under `requireSignatures` (§6.5) such an entry does not
+survive a third-party relay and must be learned from a node that wrote it
+directly. Because a direct update is always freshly signed, this only affects
+handshake snapshots. Re-authoring merged entries locally to keep them signed is
+**NOT RECOMMENDED**: it makes every merge produce a new stamped write, amplifying
+traffic and churning the descriptor for no correctness gain.
+
 ---
 
 ## 7. Task leases
@@ -569,6 +618,248 @@ requires the holder's node id — which §6.4 only accepts from the holder.
 A claimant **SHOULD** wait one propagation window (reference: 250 ms) before
 acting on a successful claim when peers are connected, and re-check. A local
 "success" cannot yet reflect a peer that claimed microseconds earlier.
+
+---
+
+## 7A. The backlog
+
+### 7A.1 Purpose
+
+A lease is a lock over a task id, and a task id by itself refers to nothing. Two
+agents describing the same work differently — `refactor-auth` and `auth-refactor`
+— each take a lease and both do the job, so the exclusion a lease provides is
+conditional on a shared vocabulary the protocol did not supply. A `task` is that
+vocabulary made into an object: what the work is, what it needs, what it waits on,
+and what came out of it.
+
+A task **MUST NOT** record who is working on it. `@task/<id>` and `@claim/<id>`
+share an id and are **joined when read, never merged**. A `holder` field on a task
+would be a second answer to a question §7 already answers, and the two would
+disagree the first time a holder crashed — the task saying "held by B" forever
+while the lease said "free". Nothing in this section changes §7.
+
+### 7A.2 Representation
+
+Key: `@task/<taskId>`, where `taskId` matches `^[A-Za-z0-9._:-]{1,128}$` — the
+same form §7 uses, because the two namespaces are joined by that id.
+
+```json
+{
+  "kind": "task",
+  "hlc": {...},
+  "title": "Port the auth module to the new token API",
+  "detail": "src/auth/*.ts — keep the public signature stable",
+  "needs": ["typescript"],
+  "deps": ["build-api"],
+  "priority": 7,
+  "status": "open",
+  "result": {"files": 6},
+  "lastError": "index shard 3 timed out",
+  "attempts": 1,
+  "createdBy": "a3f9c1b2d4e5f607",
+  "createdAt": 1785891120023
+}
+```
+
+| Field | Bound |
+|---|---|
+| `title` | string, 1 … 200 |
+| `detail` | string ≤4 000 |
+| `needs` | ≤8 tokens, each 1 … 64 (the §8.2 capability bound, so a requirement and a capability can never differ in length and silently fail to match); **sorted ascending, no duplicates** |
+| `deps` | ≤32 task ids, each matching the id pattern; **sorted ascending, no duplicates** |
+| `priority` | int, 0 … 9 |
+| `status` | one of `open`, `done`, `failed`, `cancelled` |
+| `result` | any JSON, ≤16 384 bytes serialized |
+| `lastError` | string ≤500 |
+| `attempts` | int, 0 … 1 000 (`MAX_ACCEPTED_TASK_ATTEMPTS`) |
+| `createdBy` | string, 1 … 16 |
+| `createdAt` | int epoch ms, ≥0 and ≤ `now + MAX_CLOCK_SKEW_MS` |
+
+`hlc` is the stamp of the write that last set the **descriptor** (§7A.3);
+`hlc.n` is that writer and is **not** the holder. `createdBy` is an attribution
+the writer chooses, not one the protocol enforces (§12.2); the verifiable author
+of a given write is the signature on the op (§6).
+
+`needs` and `deps` are **sets**, and a set has exactly one encoding here:
+deduplicated and sorted ascending by UTF-16 code unit. An entry whose lists are
+in any other form **MUST** be rejected at the validation boundary. It **MUST NOT**
+be repaired on receipt: repairing rewrites content the author signed, so the
+entry would have to be stored unsigned — losing attribution for an honest peer,
+and handing anyone a way to strip a signature by replaying the same operation
+with its lists shuffled. Refusing costs a well-behaved sender nothing, since the
+merge (§7A.3) emits canonical lists. Storing a non-canonical entry verbatim
+breaks idempotence: the entry changes the first time it merges with a copy of
+itself, which is reported as a change and drops its signature.
+
+Every bound above **MUST** be enforced at the validation boundary, and the
+`status`, `attempts`, `priority` and `createdAt` bounds **MUST** additionally be
+enforced **wherever an entry is seated without passing through merge** — a
+handshake snapshot and an on-disk replica are both untrusted input, and an
+implementation that rehydrates from disk by a separate path **MUST** apply them
+there too. The same requirement binds §7.2's lease bounds.
+
+### 7A.3 Task merge (join-semilattice)
+
+A task is written by several nodes — created by one, completed by another,
+retried by a third — so it **MUST NOT** be a last-write-wins register: a stale
+`open` arriving after a completion would reopen finished work. The entry is the
+**product** of independent joins:
+
+| Field group | Join |
+|---|---|
+| `status` | maximum of rank `open(0) < cancelled(1) < failed(2) < done(3)` |
+| `attempts` | maximum |
+| `deps`, `needs` | union, then truncated to the first N by sort order (§10.2) |
+| `title`, `detail`, `priority`, `createdBy`, `createdAt`, `result`, `lastError` | one **descriptor**, taken whole from the entry with the greater `(hlc, canonical descriptor)` |
+| `hlc` | the descriptor winner's stamp |
+
+**Terminal precedence is `done` > `failed` > `cancelled`.** `done` outranks
+because it is the only terminal carrying a result, and losing a real completion to
+a concurrent cancel strands every task waiting on it and causes the work to be
+redone. `failed` outranks `cancelled` because the more information-bearing
+terminal should survive.
+
+The descriptor is taken **whole**. Merging its fields individually would pair a
+title from one write with a priority from another and produce a task neither
+author wrote.
+
+`result` and `lastError` travel **inside** the descriptor rather than joining on
+their own. A field resolved by last-write-wins needs a stamp of its own, and a
+task entry carries exactly one stamp; joining `result` by `(entry stamp, content)`
+while the entry's stamp is decided by the descriptor is **not associative**. The
+counterexample: a completion stamped 100 merged with a bare descriptor write
+stamped 200 leaves the surviving result labelled 200, so a third copy carrying a
+result stamped 150 loses — while the other association order lets it win, and the
+two replicas never agree again. The consequence, which implementations **MUST**
+document rather than hide: a completion can lose its `result` to a concurrent
+descriptor write carrying a higher stamp. `status` is joined separately and
+monotone, so the task still reads `done` on every replica; only the payload is
+lost, and only when two nodes minted the same id independently.
+
+The descriptor tiebreak encoding, used only when two entries carry the same stamp,
+is canonical JSON (§5.6) over an object holding `title`, `priority`, `createdBy`
+and `createdAt`, plus `detail`, `result` and `lastError` when present.
+
+Each component is a maximum over a total order or a set union, so each is
+commutative, associative and idempotent; a product of join-semilattices is a
+join-semilattice. Every replica therefore reaches the same task from the same ops
+in any delivery order, and re-delivering a completion changes nothing.
+
+The lattice's elements are entries whose `deps` and `needs` are deduplicated,
+sorted and inside their caps. An entry outside that set is a non-canonical
+encoding of one, and the first merge maps it in — the same treatment §10.2 gives
+an over-cap set.
+
+**Signature handling.** The join produces content, never authorship:
+
+- If the merged content equals **both** inputs' content, return whichever carries
+  a signature. Identical content implies the same author, because content includes
+  `hlc.n` and §6.4 binds `by` to it, and signing is deterministic — so this is the
+  same decision on every replica.
+- If it equals exactly one input's content, return that input, signature intact.
+- Otherwise the entry is a genuine combination with no single author and **MUST**
+  be stored unsigned (§6.6).
+
+### 7A.4 Guarantees and limits (normative statement)
+
+- Once two nodes have exchanged ops, they **agree on every field of every task**.
+- Two **partitioned** nodes **MAY** each lease and complete the same open task. On
+  reconnect the later result wins and the earlier one is lost. The backlog
+  inherits §7.4's limit exactly; it is **not** a scheduler with a quorum, and an
+  implementation **MUST NOT** present it as one.
+- `deps` is **not** a guarantee that work happens in order. It is a guarantee that
+  a task whose dependencies are unfinished is not *offered*. A lease may still be
+  taken on any id (§7), so an agent that ignores the backlog is not prevented from
+  doing anything.
+- Because `deps` unions and can never shrink, a dependency that ends `failed` or
+  `cancelled` blocks its dependents **permanently**. An implementation **MUST**
+  surface this (as `blockedBy`, or equivalent) rather than leave a task that
+  mysteriously never comes up. The escape is to cancel the dependent and create a
+  replacement.
+- An **unknown** dependency — one naming no task on this replica — **MUST** count
+  as unsatisfied. A replica that has not finished syncing must not conclude the
+  work is clear.
+- Abandonment is **observed, not detected**. A lapsed lease over an open task is
+  reported when an agent next asks the board for work. Nothing wakes on a timer,
+  because P2PA has no failure detector and a timer here would claim a guarantee
+  the rest of the protocol does not make.
+
+### 7A.5 Trust — the first namespace that is not owner-bound
+
+| Namespace | Rule |
+|---|---|
+| `@agent/<id>` | Only the node whose id is in the key may write it (§8.3) |
+| `@claim/<id>` | Anyone may claim; only the holder may release (§7.3) |
+| `@task/<id>` | **Any authorized peer may create, complete, requeue or cancel any task** |
+
+This asymmetry is deliberate and load-bearing: a peer that could not complete work
+it did not create could not be delegated to, which is the whole point. The
+consequences are stated in §12.2.
+
+Because merge is monotone, the destructive direction is one-way: a peer can end a
+task, not silently reopen one. A malicious `open` arriving after a completion is
+discarded by the status join.
+
+### 7A.6 Bounds
+
+| Bound | Value | Purpose |
+|---|---|---|
+| `MAX_TASK_KEYS` | 500 | Separate budget, so a flood of tasks cannot crowd out shared context. A legibility bound as much as a memory one |
+| Eviction at the budget | oldest terminal task, by `(hlc.w, key)` | So the budget is a queue depth, not a lifetime cap |
+| `TASK_RETENTION_MS` | 604 800 000 | How long a settled task is retained before collection (§5.4.4) |
+| `TASK_MAX_ATTEMPTS` | 3 | Attempts before a task is dead-lettered rather than requeued |
+
+`TASK_RETENTION_MS` alone is not a release valve: it measures from the settling
+stamp, so a board of 500 finished tasks stays full for the whole retention window
+and every attempt to add work is refused for that long — a single authorized peer
+could otherwise wedge task creation swarm-wide. When a write meets the budget, an
+implementation **SHOULD** evict the longest-settled task before refusing. Only
+**terminal** entries are eligible: evicting an `open` one loses the work rather
+than the record of it, which is why an implementation **MUST** refuse rather than
+evict when every task on the board is still open — and **MUST** say so, rather
+than advising the operator to settle work that is already settled.
+
+Eviction **MUST** apply on the merge path as well as the local one. A flood fills
+every node's budget at the same time, which is the case eviction exists for, so a
+node that makes room locally and then refuses the peer's copy of the very task it
+just admitted reports work as created that no peer can see. Two replicas both at
+the cap would also reject each other's entries indefinitely: they never
+reconcile, so their digests never match and the whole document re-ships on every
+reconnect.
+
+**`MAX_TASK_KEYS` is therefore approximate, not exact, and replicas may hold
+different subsets.** Choosing the minimum terminal entry by `(hlc.w, key)` is a
+pure function of *one* document, so it needs no coordination to compute — but two
+replicas reach the cap holding different documents, so they evict different
+entries and stay diverged on which settled tasks they retain. This is a
+deliberate trade of exactness for liveness, and an implementation **MUST NOT**
+present the cap as a guarantee that two replicas hold the same 500 tasks.
+Convergence still holds for every task both replicas retain: eviction drops only
+terminal entries, and a dropped entry that arrives again is simply re-admitted.
+
+A task whose `attempts` has reached `TASK_MAX_ATTEMPTS` **MUST NOT** be offered
+even when its `status` is still `open`: a peer can send `attempts: 999` with
+`status: "open"`, and without this rule the board keeps offering work everybody
+has already given up on.
+
+### 7A.7 Interoperability (normative)
+
+`task` is a **new entry kind**, not a new field. §4.1's "unknown fields MUST be
+ignored" does not cover it: a kind is discriminated, so a receiver that does not
+implement `task` fails validation on the whole frame carrying one, not on the one
+operation.
+
+Therefore a sender **MUST NOT** include `task` entries in any frame written to a
+connection that did not negotiate the `task` capability:
+
+1. A handshake snapshot **MUST** be filtered **before** chunking, so the `part`/`of`
+   counts the receiver checks still describe what it is sent.
+2. An `update` **MUST** have its task ops removed, and when **nothing survives**
+   the filter the frame **MUST NOT** be written at all — an empty `ops` array
+   fails the receiver's minimum-length check and is refused as malformed.
+
+Inbound is **not** gated on the capability. A flag means "I implement this", not
+"I require it" (§4.4): anything that validates is merged.
 
 ---
 
@@ -755,6 +1046,7 @@ Every value here is a defence against a peer, not a tuning parameter.
 |---|---|
 | `MAX_CRDT_KEYS` | 10 000 (live keys; tombstones excluded) |
 | `MAX_CLAIM_KEYS` | 1 000 (separate budget, so leases cannot crowd out context) |
+| `MAX_TASK_KEYS` | 500 (separate budget again; see §7A.6) |
 | `MAX_SET_ELEMENTS` | 5 000 per set |
 | `MAX_SET_TOMBSTONES` | 10 000 per set |
 | `MAX_VALUE_BYTES` | 65 536 per entry |
@@ -856,6 +1148,27 @@ p2pa-op-v1\nplan\n{"hlc":{"c":0,"n":"aaaaaaaaaaaaaaaa","w":1},"kind":"lww","valu
 | 3–4 | 5–2 | incompatible (invalid range) |
 | caps `[sig,chunk]` | caps `[sig,telepathy]` | `{sig}` |
 
+### 11.6 Task merge
+
+```
+status join:      open ⊔ done = done       failed ⊔ cancelled = failed
+                  done ⊔ cancelled = done  done ⊔ failed = done
+attempts join:    2 ⊔ 5 = 5
+deps join:        ["a"] ⊔ ["b"] = ["a","b"]        (sorted)
+descriptor:       {w:100,n:"aaaa",title:"X",pri:5} ⊔ {w:200,n:"bbbb",title:"Y",pri:1}
+                  → title "Y", priority 1, hlc {w:200,n:"bbbb"}
+result:           {w:100,result:"early"} ⊔ {w:200,result:"late"} → "late"
+idempotence:      x ⊔ x ≡ x  (content-identical, including signature)
+```
+
+Every vector is symmetric: swapping the two operands **MUST** give the same
+answer.
+
+Idempotence holds over **canonical** entries — those whose `deps` and `needs` are
+deduplicated and sorted (§7A.2). An entry in any other form is refused at the
+validation boundary, so it can never be seated and the vector is total over
+everything a replica can hold.
+
 ---
 
 ## 12. Security model
@@ -871,6 +1184,7 @@ p2pa-op-v1\nplan\n{"hlc":{"c":0,"n":"aaaaaaaaaaaaaaaa","w":1},"kind":"lww","valu
 | A peer cannot write as *us* | Own-identity rule (§6.4) |
 | A peer cannot forge an agent card | Ownership rule (§8.3) stops a card in the *wrong slot* unconditionally. A card in its correct slot, fabricated and relayed, is stopped only with `requireSignatures` (§6.5) |
 | A peer cannot end another's lease | A release carries the holder's stamp (§7.3), so forging one directly is refused by sender binding; via relay, only with `requireSignatures`. Note a peer *can* legitimately displace a live lease with a higher generation — see §7.4 |
+| A peer cannot reopen a settled task | The status join is monotone (§7A.3) — a late `open` is discarded |
 | A peer cannot replace the document | Snapshots are merge-only (§9.3) |
 | A peer cannot wedge our clock | Skew ceiling (§5.3) |
 | A peer cannot exhaust memory | §10 bounds, §10.3 rate and flow control |
@@ -883,7 +1197,28 @@ p2pa-op-v1\nplan\n{"hlc":{"c":0,"n":"aaaaaaaaaaaaaaaa","w":1},"kind":"lww","valu
 - **Unsigned relays under default policy.** With `requireSignatures` off, a
   three-node swarm permits fabricated attribution in a relayed snapshot. §6.5.
 - **Merged OR-set attribution.** §6.6.
-- **Lease exclusivity across a partition.** §7.4.
+- **Lease exclusivity across a partition.** §7.4, and §7A.4 for the backlog,
+  which inherits it.
+- **Backlog integrity against an authorized peer.** `@task/` is the one namespace
+  that is not owner-bound (§7A.5). An authorized peer can mark your work `done`
+  with a fabricated `result`, or `cancelled` so nobody picks it up. This widens
+  what a peer *inside* the allowlist can do, not who is inside it — such a peer
+  could already write any state key and take any lease. `createdBy` is
+  peer-chosen and is not an identity; the signature on the op and `hlc.n` are.
+  Merge is monotone, so the destructive direction is one-way.
+- **Result durability under a concurrent descriptor write.** §7A.3: a completion
+  can lose its `result` — never its `done` status — to a concurrent write with a
+  higher stamp on the same id.
+- **Backlog eviction as a deletion primitive.** §7A.6 lets a write at the budget
+  drop the longest-settled task. Because `@task/` is not owner-bound, an
+  authorized peer can settle a task of yours and then fill the remaining budget
+  with open tasks, leaving that one entry as the only eviction candidate — so its
+  own next task operation evicts that entry, without needing you to write
+  anything. Before eviction existed the
+  same peer had to wait out `TASK_RETENTION_MS`. This is a faster route to an
+  outcome §12.2 already grants such a peer (it can overwrite your result outright,
+  or cancel the task), not a new class of power, but it is a real capability and
+  is recorded here rather than left to be discovered.
 - **Topic secrecy.** A leaked topic reveals that a swarm exists and allows
   connection attempts. In `strict` mode it grants no access.
 - **Peer-supplied text.** `label`, `note`, `role`, `capabilities`, `text`,
@@ -905,6 +1240,9 @@ p2pa-op-v1\nplan\n{"hlc":{"c":0,"n":"aaaaaaaaaaaaaaaa","w":1},"kind":"lww","valu
 
 Versions 1 and 2 are retired and **MUST NOT** be accepted.
 
+The `@task/` namespace (§7A) is **not** a version. It is negotiated by the `task`
+capability, per §14.3 — see the note there.
+
 ---
 
 ## 14. Extending this protocol
@@ -918,3 +1256,16 @@ Versions 1 and 2 are retired and **MUST NOT** be accepted.
 
 Prefer 1–3. A version bump costs every operator an upgrade; a capability flag
 costs nothing and degrades cleanly.
+
+**A new entry kind is case 3, never case 1.** §4.1's "unknown fields MUST be
+ignored" covers *fields* and *frame types*. An entry `kind` is discriminated, not
+additive, so a receiver that does not know it rejects the **whole frame** carrying
+it rather than the one operation. A new entry kind therefore always requires a
+capability token *and* a sending-side gate that strips it from every frame written
+to a peer that lacks the token (§7A.7). Without that gate the new kind does not
+degrade — it silently stops the older peer syncing anything at all.
+
+A bump would also buy nothing here: negotiation settles on `min(local.max,
+remote.max)`, so a newer node talking to an older one lands on the older version
+and would *still* need a per-connection gate to decide whether to send the new
+kind. The version would be a second, redundant name for the capability.
