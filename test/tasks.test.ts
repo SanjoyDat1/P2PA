@@ -1642,6 +1642,52 @@ describe("the board a human reads", () => {
     assert.equal(after(), 1, "an already-settled task is not settled again");
   });
 
+  /**
+   * The "before" status has to be the one held when the batch began, not the one
+   * left by the last op mentioning that key. Otherwise a peer suppresses the
+   * entry for one extra op: it sends the settlement and any trivial follow-up
+   * together, the follow-up's own "before" is already terminal, the transition
+   * test fails, and a settlement in the one namespace anybody may write is
+   * recorded as nothing but a generic State Update.
+   */
+  it("records the settlement when one envelope also carries a later op for it", () => {
+    const created = createTask(b, { title: "delegated work" });
+    assert.ok(created.ok);
+    if (!created.ok) return;
+    handleInboundOps(a, taskOps(b, created.taskId), "Peer");
+
+    completeTask(b, created.taskId, "the result");
+    const settled = b.store.task(created.taskId) as TaskEntry;
+
+    // Both land, in one envelope: the genuine settlement, then a follow-up that
+    // changes content without being a settlement itself. The follow-up has to
+    // be authentically signed, or it is refused before it can suppress
+    // anything and the test would pass for the wrong reason.
+    const followUp = b.signer.signOp({
+      key: taskKeyFor(created.taskId),
+      entry: { ...settled, attempts: settled.attempts + 1 },
+    });
+    assert.equal(verifyOp(followUp).status, "valid", "the follow-up is authentic");
+
+    const summary = handleInboundOps(
+      a,
+      [{ key: taskKeyFor(created.taskId), entry: settled }, followUp],
+      "Peer",
+      { fingerprint: "7c21ab90", label: "sanjoy-laptop" },
+    );
+
+    assert.equal(summary.applied, 2);
+    assert.equal(a.store.task(created.taskId)?.status, "done");
+
+    const audit = sectionOf(readFileSync(a.log.path, "utf8"), "## Audit Trail");
+    assert.equal(
+      audit.split("[ACTION: Task Settled]").length - 1,
+      1,
+      "the settlement is recorded even when a later op for the same key follows it",
+    );
+    assert.match(audit, /\*\*Outcome:\*\* done/);
+  });
+
   it("survives an export and reload with its status, attempts and deps intact", async () => {
     const dep = createTask(a, { title: "build the api" });
     assert.ok(dep.ok);
@@ -1991,6 +2037,31 @@ describe("locally minted operations stay on the wire schema", () => {
       true,
     );
     assert.equal(createTask(a, { title: "ordinary work" }).ok, true);
+  });
+
+  /**
+   * The legacy seeding path reaches `setValue` directly, so the check on the
+   * ordinary write path does not cover it. It is fed from the Active State
+   * section of `shared_context.md`, which may have been hand edited — and a key
+   * seeded there is undeletable for the same reason as above.
+   */
+  it("skips a legacy key the wire schema would refuse", () => {
+    const seeded = a.store.hydrateLegacy({
+      plan: "carried over",
+      "bad key | ## forged": "poison",
+    });
+
+    assert.equal(seeded, 1, "only the deliverable key is seeded");
+    assert.equal(a.store.get("plan"), "carried over");
+    assert.equal(a.store.get("bad key | ## forged"), undefined);
+    assert.equal(
+      PeerEnvelopeSchema.safeParse({
+        type: "snapshot",
+        v: PROTOCOL_VERSION,
+        ops: a.store.export(),
+      }).success,
+      true,
+    );
   });
 });
 

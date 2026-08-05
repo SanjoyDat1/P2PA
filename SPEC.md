@@ -1212,8 +1212,9 @@ everything a replica can hold.
 - **Backlog eviction as a deletion primitive.** §7A.6 lets a write at the budget
   drop the longest-settled task. Because `@task/` is not owner-bound, an
   authorized peer can settle a task of yours and then fill the remaining budget
-  with open tasks, leaving that one entry as the only eviction candidate — so the
-  next task created on your node deletes its result. Before eviction existed the
+  with open tasks, leaving that one entry as the only eviction candidate — so its
+  own next task operation evicts that entry, without needing you to write
+  anything. Before eviction existed the
   same peer had to wait out `TASK_RETENTION_MS`. This is a faster route to an
   outcome §12.2 already grants such a peer (it can overwrite your result outright,
   or cancel the task), not a new class of power, but it is a real capability and

@@ -474,6 +474,11 @@ export class ContextStore {
       if (isClaimKey(key) || isTaskKey(key)) continue;
       // Re-stamping somebody else's card under this node's id would forge it.
       if (isAgentKey(key)) continue;
+      // The document this reads from is untrusted — it may have been hand
+      // edited. A key the wire schema refuses would be seeded here and then
+      // ride `export()` into every snapshot, which no peer can parse, and a
+      // tombstone cannot undo it because the delete carries the same key.
+      if (!CONTEXT_KEY_PATTERN.test(key)) continue;
       this.doc.setValue(key, value);
       seeded += 1;
     }

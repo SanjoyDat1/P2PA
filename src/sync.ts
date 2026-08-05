@@ -332,7 +332,16 @@ function absorb(
 
   for (const result of results) {
     if (result.status === "applied" || result.status === "contended") {
-      if (isTaskKey(result.key)) wasStatus.set(result.key, result.previousStatus);
+      // First observation, not the last: one envelope may carry several ops for
+      // the same task, and the status that matters is the one held when the
+      // batch began. Recording the last would let a peer suppress the entry
+      // entirely by sending the settlement and any trivial follow-up together —
+      // the follow-up's "before" is already terminal, so the transition test
+      // fails and a settlement in the one namespace anybody may write goes
+      // unattributed.
+      if (isTaskKey(result.key) && !wasStatus.has(result.key)) {
+        wasStatus.set(result.key, result.previousStatus);
+      }
     }
     if (result.status === "applied") {
       summary.applied += 1;
