@@ -32,6 +32,7 @@ import {
   MIN_TASK_PRIORITY,
   TASK_KEY_PREFIX,
   TASK_STATUS,
+  isCanonicalTokenList,
 } from "./task.js";
 
 export type Source = "Local" | "Peer";
@@ -309,11 +310,31 @@ const TaskEntrySchema = z.object({
   hlc: HlcSchema,
   title: z.string().min(1).max(MAX_TASK_TITLE),
   detail: z.string().max(MAX_TASK_DETAIL).optional(),
+  /**
+   * `needs` and `deps` are sets, and a set has exactly one encoding here:
+   * deduplicated and sorted ascending.
+   *
+   * Enforced rather than repaired. The merge maps any list into that form, so an
+   * entry stored in another form is changed the first time it meets a copy of
+   * itself — reported as a change, re-rendered, re-audited, and stripped of the
+   * author's signature, which under `requireSignatures` stops that task being
+   * relayed onward at all. Repairing on receipt would rewrite signed content and
+   * cause the same signature loss; refusing costs an honest sender nothing.
+   */
   needs: z
     .array(z.string().min(1).max(MAX_CAPABILITY_TEXT))
     .max(MAX_TASK_NEEDS)
+    .refine(isCanonicalTokenList, {
+      message: "Task needs must be sorted ascending with no duplicates",
+    })
     .optional(),
-  deps: z.array(z.string().regex(TASK_ID_PATTERN)).max(MAX_TASK_DEPS).optional(),
+  deps: z
+    .array(z.string().regex(TASK_ID_PATTERN))
+    .max(MAX_TASK_DEPS)
+    .refine(isCanonicalTokenList, {
+      message: "Task deps must be sorted ascending with no duplicates",
+    })
+    .optional(),
   priority: z.number().int().min(MIN_TASK_PRIORITY).max(MAX_TASK_PRIORITY),
   status: z.enum(TASK_STATUS),
   result: z.unknown().optional(),

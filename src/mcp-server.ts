@@ -46,10 +46,12 @@ import {
   candidatesFor,
 } from "./presence.js";
 import { nodeIdFromPublicKey } from "./hlc.js";
+import { sanitizeLabel } from "./peer-key.js";
 import {
   DEFAULT_CLAIM_TTL_MS,
   MAX_CLAIM_TTL_MS,
   MIN_CLAIM_TTL_MS,
+  TASK_ID_PATTERN,
 } from "./claim.js";
 import { DEFAULT_WAIT_MS, MAX_WAIT_MS, type EventBus } from "./events.js";
 import type { Outbox } from "./outbox.js";
@@ -203,6 +205,35 @@ function renderTask(view: TaskView): Record<string, unknown> {
   };
 }
 
+/** Distinct peer-authored strings named in a diagnostic before it says "+N more". */
+const MAX_DIAGNOSTIC_ITEMS = 10;
+
+/**
+ * One peer-authored token, safe to put in front of an agent.
+ *
+ * `hlc.n` is bounded to 64 characters of anything, and a snapshot deliberately
+ * relays stamps its sender did not author, so a node id reaching this text is
+ * neither short nor sender-bound.
+ */
+function safeToken(value: string): string {
+  return sanitizeLabel(value);
+}
+
+/**
+ * Render a set of peer-authored strings, bounded.
+ *
+ * Unbounded, this was the one task surface with no ceiling on how much peer text
+ * it put in an agent's context: 500 tasks times 8 capability tokens times 64
+ * characters is a quarter of a megabyte, returned on every call that finds no
+ * work — which is the call an idle agent makes in a loop.
+ */
+function summarize(values: string[]): string {
+  const distinct = [...new Set(values)].sort();
+  const shown = distinct.slice(0, MAX_DIAGNOSTIC_ITEMS).map(safeToken);
+  const rest = distinct.length - shown.length;
+  return rest > 0 ? `${shown.join(", ")}, +${rest} more` : shown.join(", ");
+}
+
 /**
  * Why there is nothing to do, in the terms the agent can act on.
  *
@@ -210,8 +241,12 @@ function renderTask(view: TaskView): Record<string, unknown> {
  * `await_peer_event` gives for "nothing happened". An agent told only "none"
  * cannot tell a board that is empty from one it is not qualified for, and the
  * difference decides whether it should announce a capability or go and wait.
+ *
+ * Exported because it is the one task surface whose whole body is peer-authored
+ * prose rather than a JSON envelope, so its bounds and its framing are worth
+ * asserting directly.
  */
-function explainNoWork(
+export function explainNoWork(
   views: TaskView[],
   capabilities: Set<string>,
   announced: boolean,
@@ -224,16 +259,12 @@ function explainNoWork(
   const unqualified = open.filter(
     (view) => !view.needs.every((need) => capabilities.has(need)),
   );
-  const missing = [
-    ...new Set(
-      unqualified.flatMap((view) =>
-        view.needs.filter((need) => !capabilities.has(need)),
-      ),
+  const missing = summarize(
+    unqualified.flatMap((view) =>
+      view.needs.filter((need) => !capabilities.has(need)),
     ),
-  ].sort();
-  const holders = [
-    ...new Set(leased.map((view) => view.holder as string)),
-  ].sort();
+  );
+  const holders = summarize(leased.map((view) => view.holder as string));
 
   if (open.length === 0) {
     return (
@@ -251,7 +282,7 @@ function explainNoWork(
   }
   if (leased.length > 0) {
     lines.push(
-      `  ${leased.length} are already leased by peers (${holders.join(", ")}),`,
+      `  ${leased.length} are already leased by peers (${holders}),`,
     );
   }
   if (exhausted.length > 0) {
@@ -261,19 +292,23 @@ function explainNoWork(
   }
   if (unqualified.length > 0) {
     lines.push(
-      `  ${unqualified.length} need capabilities you have not announced (needs: ${missing.join(", ")}).`,
+      `  ${unqualified.length} need capabilities you have not announced (needs: ${missing}).`,
     );
   }
   if (capability !== undefined) {
-    lines.push(`  You asked only for tasks needing "${capability}".`);
+    lines.push(`  You asked only for tasks needing "${safeToken(capability)}".`);
   }
   lines.push(
     announced
-      ? `You announced: ${JSON.stringify([...capabilities].sort())}. Call announce_self to ` +
+      ? `You announced: ${summarize([...capabilities])}. Call announce_self to ` +
           `update that, or await_peer_event to be woken when a dependency clears.`
       : "You have not announced any capabilities, so only tasks with no `needs` " +
           "can be offered to you. Call announce_self with your capabilities first.",
   );
+  // This is the one task surface whose whole body is prose rather than a JSON
+  // envelope, and it interpolates peer-authored capability tokens and node ids
+  // either way, so it carries the same framing as the rest.
+  lines.push(PEER_CONTENT_NOTE);
   return lines.join("\n");
 }
 
@@ -717,11 +752,16 @@ export function createMcpServer(services: AppServices): McpServer {
           .max(MAX_TASK_NEEDS)
           .optional()
           .describe('Capabilities the doer must have announced, e.g. ["typescript"]'),
+        // The wire pattern, not a looser one. A dep is a task id that ends up
+        // inside a `@task/` key, and an agent that passes a sentence here would
+        // otherwise mint an op no peer can parse.
         deps: z
-          .array(z.string().min(1).max(128))
+          .array(z.string().min(1).max(128).regex(TASK_ID_PATTERN))
           .max(MAX_TASK_DEPS)
           .optional()
-          .describe("Task ids that must be done before this is offered"),
+          .describe(
+            "Task ids that must be done before this is offered (ids from list_tasks, not prose)",
+          ),
         priority: z
           .number()
           .int()

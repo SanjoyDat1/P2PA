@@ -128,6 +128,24 @@ export function commitLocalMutation(
     };
   }
 
+  // The op has to survive the same schema every receiver applies to it. Until
+  // now only its byte size was checked here, so a tool with a looser input
+  // schema than the wire's could mint an entry that is valid locally and
+  // unparseable everywhere else — and because a snapshot is validated as one
+  // array with no per-op tolerance, a single such entry makes this node's whole
+  // replica undeliverable to every peer, permanently. Failing the call is the
+  // only honest answer: the alternative is telling an agent its write landed
+  // while the swarm silently stops syncing.
+  const wireCheck = CrdtOpArraySchema.safeParse(produced);
+  if (!wireCheck.success) {
+    return {
+      ok: false,
+      error:
+        `Refusing to broadcast an operation no peer could read: ` +
+        `${wireCheck.error.issues[0]?.message ?? "failed wire validation"}`,
+    };
+  }
+
   services.log.syncStateUpdate(
     "Local",
     produced.map((op) => op.key),
@@ -422,6 +440,26 @@ function absorb(
       // holds keys where the merge actually changed something, so a re-delivered
       // completion merges to "ignored" and raises nothing.
       if (source !== "Peer") continue;
+
+      // A peer's settlement is recorded as one, not as a generic key change.
+      // Without this the file said only that `@task/<id>` moved — never to what,
+      // and never by whom — which is exactly the question an audit trail exists
+      // to answer for the one namespace any peer is allowed to write. The local
+      // half of this is written by `settle()`.
+      if (isTerminal(view.status)) {
+        services.log.syncMarkdownLog({
+          source,
+          ...(peer !== undefined ? { peer } : {}),
+          action: "Task Settled",
+          taskId: view.taskId,
+          status: view.status,
+          attempt: view.attempts,
+          // From the entry's own stamp: the node that wrote the outcome, which
+          // is neither necessarily the lease holder nor the creator.
+          settledBy: view.settledBy,
+          ...(view.lastError !== null ? { detail: view.lastError } : {}),
+        });
+      }
       if (view.status === "done") {
         services.events?.emit({
           kind: "task_done",
@@ -805,7 +843,7 @@ function settle(
     taskId,
     status: view.status,
     attempt: view.attempts,
-    settledBy: services.store.nodeId,
+    settledBy: view.settledBy,
     ...(view.lastError !== null ? { detail: view.lastError } : {}),
   });
 

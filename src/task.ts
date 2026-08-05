@@ -298,6 +298,36 @@ function compareDescriptor(a: TaskEntry, b: TaskEntry): number {
 }
 
 /**
+ * The canonical form of a token list: deduplicated and sorted.
+ *
+ * `deps` and `needs` are sets, and a set has one encoding. Two encodings of the
+ * same set are two byte sequences that mean the same thing, which is precisely
+ * what breaks idempotence: the join maps them both to this form, so an entry
+ * stored in any other form is changed the first time it merges with a copy of
+ * itself — reported as a change, re-rendered, re-audited, and stripped of its
+ * author's signature because the content no longer matches what was signed.
+ */
+export function canonicalTokens(values: readonly string[]): string[] {
+  return [...new Set(values)].sort();
+}
+
+/**
+ * Is this list already in canonical form?
+ *
+ * Checked at the validation boundary rather than repaired on the way in.
+ * Repairing would rewrite content a peer signed, so the entry would have to be
+ * stored unsigned — losing attribution for an honest peer, and handing anyone
+ * a way to strip a signature by replaying the same op with its list shuffled.
+ * Refusing costs a well-behaved sender nothing: it emits the canonical form.
+ */
+export function isCanonicalTokenList(values: readonly string[]): boolean {
+  for (let i = 1; i < values.length; i += 1) {
+    if ((values[i - 1] as string) >= (values[i] as string)) return false;
+  }
+  return true;
+}
+
+/**
  * Union two token lists, then truncate to the smallest N by sort order.
  *
  * Sorted, not insertion-ordered: if `x` is dropped then at least N elements
@@ -416,7 +446,14 @@ export function isTaskCollectable(entry: TaskEntry, now: number): boolean {
   return isTerminal(entry.status) && now - entry.hlc.w > TASK_RETENTION_MS;
 }
 
-/** Build the next draft from what is on record, changing only what was asked. */
+/**
+ * Build the next draft from what is on record, changing only what was asked.
+ *
+ * The token lists come out canonical whatever went in, because this is the last
+ * point before a local write is stamped and signed — and an entry whose lists
+ * are not canonical is refused at the validation boundary, so minting one here
+ * would produce an op no peer could read.
+ */
 export function draftFrom(entry: TaskEntry, patch: Partial<TaskDraft>): TaskDraft {
   const base: TaskDraft = {
     title: entry.title,
@@ -431,7 +468,12 @@ export function draftFrom(entry: TaskEntry, patch: Partial<TaskDraft>): TaskDraf
     createdBy: entry.createdBy,
     createdAt: entry.createdAt,
   };
-  return { ...base, ...patch };
+  const merged = { ...base, ...patch };
+  return {
+    ...merged,
+    ...(merged.needs !== undefined ? { needs: canonicalTokens(merged.needs) } : {}),
+    ...(merged.deps !== undefined ? { deps: canonicalTokens(merged.deps) } : {}),
+  };
 }
 
 /**
@@ -488,6 +530,15 @@ export interface TaskView {
   runnable: boolean;
   heldByYou: boolean;
   createdBy: string;
+  /**
+   * Node that last wrote the descriptor, from the entry's own stamp.
+   *
+   * Unlike `createdBy` this is not peer-chosen: `verifyOp` binds a signature's
+   * `by` to `hlc.n`, so on a signed entry it is the one attribution here that
+   * cannot be claimed by somebody else. It is the *writer*, not the holder —
+   * who was working on the task is the lease's answer and only the lease's.
+   */
+  settledBy: string;
   createdAt: string;
   /** Epoch ms, so FIFO ordering never depends on re-parsing a rendered string. */
   createdAtMs: number;
@@ -558,6 +609,7 @@ export function describeTask(
     heldByYou:
       context.selfNodeId !== undefined && holder === context.selfNodeId,
     createdBy: entry.createdBy,
+    settledBy: entry.hlc.n,
     createdAt: new Date(entry.createdAt).toISOString(),
     createdAtMs: entry.createdAt,
     result: entry.result ?? null,

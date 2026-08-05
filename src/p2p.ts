@@ -1196,10 +1196,23 @@ export function downgrade(
   version: number,
   caps: ReadonlySet<string>,
 ): PeerEnvelope | null {
-  if (envelope.type === "update" && !caps.has(CAP_TASKS)) {
-    const ops = opsForPeer(envelope.ops, caps);
-    if (ops.length === 0) return null;
-    if (ops.length !== envelope.ops.length) return { ...envelope, ops, v: version };
+  if (!caps.has(CAP_TASKS)) {
+    if (envelope.type === "update") {
+      const ops = opsForPeer(envelope.ops, caps);
+      if (ops.length === 0) return null;
+      if (ops.length !== envelope.ops.length) return { ...envelope, ops, v: version };
+    }
+    // A snapshot is filtered before chunking, so by the time one reaches here it
+    // is already clean. Filtering again is not redundant bookkeeping: this
+    // function is exported and documented as the place a frame is shaped for
+    // what a connection can read, so the next caller to route a snapshot
+    // through it must not silently lose the §7A.7 guarantee. Unlike an update,
+    // an emptied snapshot is still a valid frame and is sent as one — that is
+    // how a peer learns we have nothing for it.
+    if (envelope.type === "snapshot") {
+      const ops = opsForPeer(envelope.ops, caps);
+      if (ops.length !== envelope.ops.length) return { ...envelope, ops, v: version };
+    }
   }
 
   if (version >= PROTOCOL_VERSION) return { ...envelope, v: version };

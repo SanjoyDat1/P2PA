@@ -43,6 +43,7 @@ import {
   isAcceptableTaskEntry,
   isTaskCollectable,
   isTaskKey,
+  isTerminal,
   mergeTasks,
   type TaskDraft,
   type TaskEntry,
@@ -556,7 +557,23 @@ export class CrdtDoc {
    * `takeClaim` makes, and for the same reason: reporting a change every peer
    * says did not happen is worse than reporting failure.
    */
-  writeTask(key: string, draft: TaskDraft, now: number = Date.now()): CrdtOp | null {
+  writeTask(
+    key: string,
+    draft: TaskDraft,
+    now: number = Date.now(),
+    /**
+     * Last check before the entry is stored, not merely before it is sent.
+     *
+     * An entry that fails the wire schema must never reach `this.entries`: it
+     * would ride `export()` into every handshake snapshot for the rest of the
+     * process, and a snapshot is validated as one array with no per-op
+     * tolerance, so one such entry makes this replica undeliverable to every
+     * peer. Refusing after the store, in the sync layer, stops the broadcast
+     * but not that. Injected rather than imported so the CRDT core keeps no
+     * dependency on the wire schema.
+     */
+    validate?: (op: CrdtOp) => boolean,
+  ): CrdtOp | null {
     const current = this.taskEntry(key);
     if (!this.entries.has(key)) {
       // Collected against the caller's clock rather than wall time, because
@@ -564,10 +581,18 @@ export class CrdtDoc {
       // a store driven by an injected clock would otherwise decide a task it
       // stamped seconds ago had been settled for a week.
       this.collectTombstones(now);
-      if (this.taskKeyCount() >= MAX_TASK_KEYS) {
+      // Retention alone is not a release valve: it measures from the settling
+      // stamp, so a board of 500 finished tasks stays full for seven days and
+      // `create_task` refuses that whole time. Make room by dropping the
+      // longest-settled task instead. Only terminal entries are eligible —
+      // evicting an `open` one would lose the work rather than a record of it —
+      // and the choice is by `(hlc.w, key)`, which is a pure function of the
+      // document rather than of insertion order.
+      if (this.taskKeyCount() >= MAX_TASK_KEYS && !this.evictOldestSettledTask()) {
         throw new Error(
-          `backlog is at its ${MAX_TASK_KEYS}-task limit; complete_task or ` +
-            `fail_task on finished work frees a slot`,
+          `backlog is at its ${MAX_TASK_KEYS}-task limit and every task on it is ` +
+            `still open; complete_task or fail_task on work that is finished ` +
+            `frees a slot immediately`,
         );
       }
     }
@@ -575,8 +600,32 @@ export class CrdtDoc {
     const merged = current ? mergeTasks(current, fresh) : fresh;
     if (current && canonicalTask(merged) === canonicalTask(current)) return null;
     const op = this.signed({ key, entry: merged });
+    if (validate && !validate(op)) return null;
     this.entries.set(key, op.entry);
     return op;
+  }
+
+  /**
+   * Drop the longest-settled task, so the budget is a queue depth rather than a
+   * lifetime cap. Returns false when every task on the board is still open.
+   */
+  private evictOldestSettledTask(): boolean {
+    let oldestKey: string | null = null;
+    let oldest: TaskEntry | null = null;
+    for (const [key, entry] of this.entries) {
+      if (!isTask(entry) || !isTerminal(entry.status)) continue;
+      if (
+        oldest === null ||
+        entry.hlc.w < oldest.hlc.w ||
+        (entry.hlc.w === oldest.hlc.w && key < (oldestKey as string))
+      ) {
+        oldest = entry;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey === null) return false;
+    this.entries.delete(oldestKey);
+    return true;
   }
 
   // ---- merge --------------------------------------------------------------
@@ -875,6 +924,22 @@ export class CrdtDoc {
       // The replica file is treated as untrusted input, so a signature edited
       // into it by hand must not be re-relayed to peers as authentic.
       if (verifyOp(op).status === "invalid") continue;
+      // The same per-kind bounds `mergeOp` applies. This path bypasses `mergeOp`
+      // entirely, so leaving them out meant a hand-edited replica could seat an
+      // entry no peer would ever have accepted — a `createdAt` centuries ahead
+      // makes `describeTask` throw on an invalid date, which takes out
+      // `list_tasks`, `next_task`, and every inbound envelope mentioning a task,
+      // and the transport closes the connection over the throw. SPEC §7A.2 and
+      // §7.2 already require these at merge for exactly this reason.
+      if (isTask(op.entry) && !isAcceptableTaskEntry(op.entry, now)) continue;
+      if (
+        isClaim(op.entry) &&
+        (!isAcceptableTtl(op.entry.ttl) ||
+          !isAcceptableGen(op.entry.gen) ||
+          !isAcceptableClaimStamp(op.entry, now))
+      ) {
+        continue;
+      }
       if (isClaim(op.entry)) {
         if (this.claimKeyCount() >= MAX_CLAIM_KEYS) continue;
       } else if (isTask(op.entry)) {
@@ -904,6 +969,16 @@ export class CrdtDoc {
   /**
    * Digest over the backlog, which `stateHash` also excludes.
    *
+   * Hashes each entry's **whole mergeable content**, not a projection of it.
+   * That is not thoroughness for its own sake: `digestsMatch` suppresses the
+   * handshake snapshot, so a digest that ignores a field makes two replicas
+   * differing only in that field skip the one exchange that would reconcile
+   * them, and neither side has a reason to send another op. The divergence is
+   * then permanent while `sync_health` reports agreement — the worst failure
+   * shape available, and reachable with no attacker at all: two nodes creating
+   * the same id concurrently, one ending up with a dependency the other lacks.
+   * `claimsHash` covers a lease's entire content for exactly this reason.
+   *
    * Empty when there are no tasks, rather than the hash of an empty string: a
    * peer that predates this namespace sends no `tasks` digest at all, and the
    * two have to compare equal or every reconnect in a mixed swarm re-ships the
@@ -914,8 +989,10 @@ export class CrdtDoc {
     if (entries.length === 0) return "";
     const rows = entries.map(
       ({ key, entry }) =>
-        `${key}|${entry.status}|${entry.attempts}|${entry.priority}|` +
-        `${entry.hlc.w}|${entry.hlc.c}|${entry.hlc.n}`,
+        `${key}|${createHash("sha256")
+          .update(canonicalTask(entry))
+          .digest("hex")
+          .slice(0, 16)}`,
     );
     return createHash("sha256").update(rows.join("\n")).digest("hex").slice(0, 16);
   }

@@ -406,11 +406,20 @@ difference between an O(document) transfer per peer and nothing at all.
 |---|---|
 | `state` | First 16 hex characters of `SHA-256(canonicalJson(materialized document))`, where the materialized document is the plain-JSON view with tombstones, tags, leases and presence stripped (§5.5) |
 | `claims` | First 16 hex characters of `SHA-256` over the lease table: one line per lease, sorted by key, each `key\|gen\|w\|c\|n\|ttl\|released`, joined by `\n`, where `released` is `1` or `0` |
-| `tasks` | First 16 hex characters of `SHA-256` over the backlog: one line per task, sorted by key, each `key\|status\|attempts\|priority\|w\|c\|n`, joined by `\n`. **The empty string when there are no tasks** |
+| `tasks` | First 16 hex characters of `SHA-256` over the backlog: one line per task, sorted by key, each `key\|H`, where `H` is the first 16 hex characters of `SHA-256(canonical task content)` (§7A.3), joined by `\n`. **The empty string when there are no tasks** |
 
 Leases and tasks are digested separately because `state` deliberately excludes
 them: two replicas that disagree about who holds a task, or about what work
 exists, would otherwise look identical.
+
+A digest **MUST** cover the **whole mergeable content** of the entries it
+summarizes, never a projection of them. This is not thoroughness for its own
+sake. A digest match suppresses the handshake snapshot, so a field left out of a
+digest makes two replicas differing only in that field skip the one exchange that
+would reconcile them — and neither side then has any reason to send another op.
+The divergence is permanent, and it is reported as agreement. It is reachable
+with no attacker: two nodes creating the same task id concurrently, one ending up
+with a dependency the other lacks and both agreeing on every other field.
 
 `tasks` is OPTIONAL, and a receiver **MUST** treat an absent `tasks` as `""`. A
 sender with no tasks **MUST** send `""` rather than the hash of an empty input, so
@@ -656,8 +665,8 @@ same form §7 uses, because the two namespaces are joined by that id.
 |---|---|
 | `title` | string, 1 … 200 |
 | `detail` | string ≤4 000 |
-| `needs` | ≤8 tokens, each 1 … 64 (the §8.2 capability bound, so a requirement and a capability can never differ in length and silently fail to match) |
-| `deps` | ≤32 task ids, each matching the id pattern |
+| `needs` | ≤8 tokens, each 1 … 64 (the §8.2 capability bound, so a requirement and a capability can never differ in length and silently fail to match); **sorted ascending, no duplicates** |
+| `deps` | ≤32 task ids, each matching the id pattern; **sorted ascending, no duplicates** |
 | `priority` | int, 0 … 9 |
 | `status` | one of `open`, `done`, `failed`, `cancelled` |
 | `result` | any JSON, ≤16 384 bytes serialized |
@@ -671,10 +680,23 @@ same form §7 uses, because the two namespaces are joined by that id.
 the writer chooses, not one the protocol enforces (§12.2); the verifiable author
 of a given write is the signature on the op (§6).
 
+`needs` and `deps` are **sets**, and a set has exactly one encoding here:
+deduplicated and sorted ascending by UTF-16 code unit. An entry whose lists are
+in any other form **MUST** be rejected at the validation boundary. It **MUST NOT**
+be repaired on receipt: repairing rewrites content the author signed, so the
+entry would have to be stored unsigned — losing attribution for an honest peer,
+and handing anyone a way to strip a signature by replaying the same operation
+with its lists shuffled. Refusing costs a well-behaved sender nothing, since the
+merge (§7A.3) emits canonical lists. Storing a non-canonical entry verbatim
+breaks idempotence: the entry changes the first time it merges with a copy of
+itself, which is reported as a change and drops its signature.
+
 Every bound above **MUST** be enforced at the validation boundary, and the
 `status`, `attempts`, `priority` and `createdAt` bounds **MUST** additionally be
-enforced at merge — merge is reachable from a handshake snapshot and from an
-on-disk replica, both of which are untrusted input.
+enforced **wherever an entry is seated without passing through merge** — a
+handshake snapshot and an on-disk replica are both untrusted input, and an
+implementation that rehydrates from disk by a separate path **MUST** apply them
+there too. The same requirement binds §7.2's lease bounds.
 
 ### 7A.3 Task merge (join-semilattice)
 
@@ -783,8 +805,19 @@ discarded by the status join.
 | Bound | Value | Purpose |
 |---|---|---|
 | `MAX_TASK_KEYS` | 500 | Separate budget, so a flood of tasks cannot crowd out shared context. A legibility bound as much as a memory one |
+| Eviction at the budget | oldest terminal task, by `(hlc.w, key)` | So the budget is a queue depth, not a lifetime cap |
 | `TASK_RETENTION_MS` | 604 800 000 | How long a settled task is retained before collection (§5.4.4) |
 | `TASK_MAX_ATTEMPTS` | 3 | Attempts before a task is dead-lettered rather than requeued |
+
+`TASK_RETENTION_MS` alone is not a release valve: it measures from the settling
+stamp, so a board of 500 finished tasks stays full for the whole retention window
+and every attempt to add work is refused for that long — a single authorized peer
+could otherwise wedge task creation swarm-wide. When a local write meets the
+budget, an implementation **SHOULD** evict the longest-settled task before
+refusing. Only **terminal** entries are eligible: evicting an `open` one loses the
+work rather than the record of it, which is why an implementation **MUST** refuse
+rather than evict when every task on the board is still open — and **MUST** say
+so, rather than advising the operator to settle work that is already settled.
 
 A task whose `attempts` has reached `TASK_MAX_ATTEMPTS` **MUST NOT** be offered
 even when its `status` is still `open`: a peer can send `attempts: 999` with
@@ -1112,6 +1145,11 @@ idempotence:      x ⊔ x ≡ x  (content-identical, including signature)
 
 Every vector is symmetric: swapping the two operands **MUST** give the same
 answer.
+
+Idempotence holds over **canonical** entries — those whose `deps` and `needs` are
+deduplicated and sorted (§7A.2). An entry in any other form is refused at the
+validation boundary, so it can never be seated and the vector is total over
+everything a replica can hold.
 
 ---
 

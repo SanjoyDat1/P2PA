@@ -28,6 +28,7 @@ import {
   describeTask,
   isTaskKey,
   isTerminal,
+  canonicalTokens,
   slugTaskId,
   taskIdFromTaskKey,
   taskKeyFor,
@@ -42,6 +43,19 @@ import {
   type ContextState,
   type JsonValue,
 } from "./types.js";
+
+/**
+ * Would every peer accept this operation?
+ *
+ * Handed to the CRDT's local task writer so a rejected entry is never stored,
+ * not merely never sent. `export()` feeds the handshake snapshot, and a snapshot
+ * is validated as one array with no per-op tolerance — so a single entry that
+ * fails this check would make the whole replica undeliverable to every peer for
+ * as long as the process runs, and an `open` task is never collected.
+ */
+function isWireValid(op: CrdtOp): boolean {
+  return CrdtOpArraySchema.safeParse([op]).success;
+}
 
 /**
  * Shared state, backed by a per-key CRDT.
@@ -265,6 +279,19 @@ export class ContextStore {
     if (!isValidTaskId(taskId)) {
       return { ok: false, error: `Malformed task id: ${taskId}` };
     }
+    // Dependencies are task ids too, and they are the easier one to get wrong:
+    // an agent asked for "what must finish first" will happily answer in prose.
+    // An op carrying one fails the wire schema, and because a snapshot is
+    // validated as a whole array it takes every other entry down with it.
+    const malformed = (input.deps ?? []).find((dep) => !isValidTaskId(dep));
+    if (malformed !== undefined) {
+      return {
+        ok: false,
+        error:
+          `Malformed dependency id: "${malformed}". Dependencies are task ids ` +
+          `from list_tasks, not descriptions of the work.`,
+      };
+    }
     if (this.task(taskId) !== undefined) {
       return {
         ok: false,
@@ -276,8 +303,11 @@ export class ContextStore {
     const draft: TaskDraft = {
       title: input.title,
       ...(input.detail !== undefined ? { detail: input.detail } : {}),
-      ...(input.needs !== undefined ? { needs: input.needs } : {}),
-      ...(input.deps !== undefined ? { deps: input.deps } : {}),
+      // Deduplicated and sorted here, where the caller's intent is still a set:
+      // the wire schema accepts only that encoding, so an agent passing the same
+      // capability twice would otherwise mint an op no peer can read.
+      ...(input.needs !== undefined ? { needs: canonicalTokens(input.needs) } : {}),
+      ...(input.deps !== undefined ? { deps: canonicalTokens(input.deps) } : {}),
       priority: input.priority ?? DEFAULT_TASK_PRIORITY,
       status: "open",
       attempts: 0,
@@ -286,21 +316,26 @@ export class ContextStore {
     };
     let op: CrdtOp | null;
     try {
-      op = this.doc.writeTask(taskKeyFor(taskId), draft, this.now());
+      op = this.doc.writeTask(taskKeyFor(taskId), draft, this.now(), isWireValid);
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
-    // Only reachable if the merge rule discarded a write against an entry we
-    // just established does not exist, which nothing can currently produce —
-    // reported rather than asserted, because "created" must mean created.
-    if (!op) return { ok: false, error: `Could not record task "${taskId}"` };
+    // Either the merge rule discarded the write — which nothing can currently
+    // produce against an entry we just established does not exist — or the
+    // entry failed the wire schema, in which case refusing is the whole point.
+    if (!op) {
+      return {
+        ok: false,
+        error: `Could not record task "${taskId}": the entry failed validation`,
+      };
+    }
     return { ok: true, taskId, op };
   }
 
   /** Change a task that already exists. Returns null when nothing moved. */
   putTask(taskId: string, draft: TaskDraft): CrdtOp | null {
     if (!isValidTaskId(taskId)) throw new Error(`Malformed task id: ${taskId}`);
-    return this.doc.writeTask(taskKeyFor(taskId), draft, this.now());
+    return this.doc.writeTask(taskKeyFor(taskId), draft, this.now(), isWireValid);
   }
 
   /**
