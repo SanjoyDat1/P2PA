@@ -47,6 +47,7 @@ import {
   mergeTasks,
   type TaskDraft,
   type TaskEntry,
+  type TaskStatus,
 } from "./task.js";
 import type { ContextState, JsonValue } from "./types.js";
 
@@ -134,6 +135,15 @@ export interface MergeResult {
   status: MergeStatus;
   /** Set when an existing value written by a different node was replaced. */
   previousNode?: string;
+  /**
+   * Status a task held before this op, when one was already on record.
+   *
+   * Absent means the key was new here. Callers need it to tell a *transition*
+   * into a terminal state from any later change to a task that was already
+   * settled — otherwise a peer can nudge one finished task indefinitely and each
+   * nudge reads as a fresh settlement.
+   */
+  previousStatus?: TaskStatus;
   /** Set when status is "rejected". */
   reason?: string;
 }
@@ -575,19 +585,23 @@ export class CrdtDoc {
     validate?: (op: CrdtOp) => boolean,
   ): CrdtOp | null {
     const current = this.taskEntry(key);
+    const fresh: TaskEntry = { kind: "task", hlc: this.clock.tick(), ...draft };
+    const merged = current ? mergeTasks(current, fresh) : fresh;
+    if (current && canonicalTask(merged) === canonicalTask(current)) return null;
+    const op = this.signed({ key, entry: merged });
+    if (validate && !validate(op)) return null;
+
+    // Budget last, after every reason to refuse. Making room first meant a write
+    // that then failed validation had already destroyed a settled task on its
+    // way out — a caller reading `null` has no way to know something was
+    // deleted, and "may delete an entry even when it returns null" is not a
+    // contract anyone should have to discover.
     if (!this.entries.has(key)) {
       // Collected against the caller's clock rather than wall time, because
       // retention here is measured against the same stamps this replica writes:
       // a store driven by an injected clock would otherwise decide a task it
       // stamped seconds ago had been settled for a week.
       this.collectTombstones(now);
-      // Retention alone is not a release valve: it measures from the settling
-      // stamp, so a board of 500 finished tasks stays full for seven days and
-      // `create_task` refuses that whole time. Make room by dropping the
-      // longest-settled task instead. Only terminal entries are eligible —
-      // evicting an `open` one would lose the work rather than a record of it —
-      // and the choice is by `(hlc.w, key)`, which is a pure function of the
-      // document rather than of insertion order.
       if (this.taskKeyCount() >= MAX_TASK_KEYS && !this.evictOldestSettledTask()) {
         throw new Error(
           `backlog is at its ${MAX_TASK_KEYS}-task limit and every task on it is ` +
@@ -596,11 +610,6 @@ export class CrdtDoc {
         );
       }
     }
-    const fresh: TaskEntry = { kind: "task", hlc: this.clock.tick(), ...draft };
-    const merged = current ? mergeTasks(current, fresh) : fresh;
-    if (current && canonicalTask(merged) === canonicalTask(current)) return null;
-    const op = this.signed({ key, entry: merged });
-    if (validate && !validate(op)) return null;
     this.entries.set(key, op.entry);
     return op;
   }
@@ -608,6 +617,19 @@ export class CrdtDoc {
   /**
    * Drop the longest-settled task, so the budget is a queue depth rather than a
    * lifetime cap. Returns false when every task on the board is still open.
+   *
+   * Retention alone is not a release valve: it measures from the settling stamp,
+   * so a board of finished work stays full for the whole window. Only terminal
+   * entries are eligible — evicting an `open` one loses the work rather than the
+   * record of it.
+   *
+   * The *choice* is a pure function of one document, so it needs no coordination
+   * to make. It does **not** follow that two replicas evict the same task: they
+   * reach the cap holding different documents, so they drop different entries
+   * and the cap is approximate rather than exact. That is the deliberate trade —
+   * see SPEC §7A.6 — and it is why this must also run on the merge path: a
+   * replica that evicts locally and then refuses the peer's copy of the very
+   * task it just made room for is worse than either behaviour on its own.
    */
   private evictOldestSettledTask(): boolean {
     let oldestKey: string | null = null;
@@ -693,7 +715,14 @@ export class CrdtDoc {
           return { key, status: "rejected", reason: "lease limit reached" };
         }
       } else if (isTask(entry)) {
-        if (this.taskKeyCount() >= MAX_TASK_KEYS) {
+        // The same eviction the local path makes, and not merely for symmetry.
+        // A peer flood fills every node's budget at once — the case eviction
+        // exists for — so a node that made room locally and then refused the
+        // peer's copy of that same task would report "created, N peers can see
+        // it" while no peer could. Worse, two replicas both at the cap reject
+        // each other's entries forever: they never reconcile, so the digest
+        // never matches and the whole document re-ships on every reconnect.
+        if (this.taskKeyCount() >= MAX_TASK_KEYS && !this.evictOldestSettledTask()) {
           return { key, status: "rejected", reason: "task limit reached" };
         }
       } else if (this.liveKeyCount() >= MAX_CRDT_KEYS) {
@@ -731,7 +760,7 @@ export class CrdtDoc {
           return { key, status: "ignored" };
         }
         this.entries.set(key, merged);
-        return { key, status: "applied" };
+        return { key, status: "applied", previousStatus: current.status };
       }
       this.entries.set(key, entry);
       return { key, status: "applied" };

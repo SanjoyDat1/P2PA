@@ -9,6 +9,7 @@ import {
   PROTOCOL_VERSION,
   type AuditPeer,
   type ContextState,
+  type TaskSettlement,
   type JsonValue,
   type Source,
 } from "./types.js";
@@ -318,8 +319,21 @@ function absorb(
   const summary: InboundSummary = emptySummary();
   const touched: string[] = [];
   const refused: string[] = [];
+  /**
+   * What a task's status was before this batch, per key.
+   *
+   * Kept so the audit trail can record a *transition* into a terminal state
+   * rather than any later change to a task that was already settled. Without
+   * that distinction a peer can nudge one finished task indefinitely and every
+   * nudge reads as a fresh settlement — a peer-controlled lever on the live
+   * audit file, which is bounded and rotates.
+   */
+  const wasStatus = new Map<string, TaskStatus | undefined>();
 
   for (const result of results) {
+    if (result.status === "applied" || result.status === "contended") {
+      if (isTaskKey(result.key)) wasStatus.set(result.key, result.previousStatus);
+    }
     if (result.status === "applied") {
       summary.applied += 1;
       touched.push(result.key);
@@ -429,6 +443,7 @@ function absorb(
     const views = services.store.listTasks();
     const byId = new Map(views.map((view) => [view.taskId, view]));
     const finished: string[] = [];
+    const settlements: TaskSettlement[] = [];
 
     for (const key of taskKeys.slice(0, 50)) {
       const taskId = taskIdFromTaskKey(key);
@@ -441,16 +456,19 @@ function absorb(
       // completion merges to "ignored" and raises nothing.
       if (source !== "Peer") continue;
 
-      // A peer's settlement is recorded as one, not as a generic key change.
-      // Without this the file said only that `@task/<id>` moved — never to what,
-      // and never by whom — which is exactly the question an audit trail exists
-      // to answer for the one namespace any peer is allowed to write. The local
-      // half of this is written by `settle()`.
-      if (isTerminal(view.status)) {
-        services.log.syncMarkdownLog({
-          source,
-          ...(peer !== undefined ? { peer } : {}),
-          action: "Task Settled",
+      // A peer's settlement is recorded as one, not as a generic key change:
+      // without it the file said only that `@task/<id>` moved, never to what or
+      // by whom, which is the question an audit trail exists to answer for the
+      // one namespace any peer is allowed to write. Collected here and written
+      // once below — an audit write re-reads and rewrites the whole document, so
+      // one per settled task would make an envelope quadratic in its size.
+      //
+      // Only on the *transition* into a terminal state. A task that was already
+      // settled changing again is an ordinary merge, and treating each one as a
+      // settlement hands a peer a lever on the live audit window.
+      const before = wasStatus.get(key);
+      if (isTerminal(view.status) && (before === undefined || !isTerminal(before))) {
+        settlements.push({
           taskId: view.taskId,
           status: view.status,
           attempt: view.attempts,
@@ -510,6 +528,15 @@ function absorb(
           announced += 1;
         }
       }
+    }
+
+    if (settlements.length > 0) {
+      services.log.syncMarkdownLog({
+        source,
+        peer,
+        action: "Task Settled",
+        tasks: settlements,
+      });
     }
 
     services.log.rewriteBacklog(views);
@@ -840,11 +867,15 @@ function settle(
   services.log.syncMarkdownLog({
     source: "Local",
     action: "Task Settled",
-    taskId,
-    status: view.status,
-    attempt: view.attempts,
-    settledBy: view.settledBy,
-    ...(view.lastError !== null ? { detail: view.lastError } : {}),
+    tasks: [
+      {
+        taskId,
+        status: view.status,
+        attempt: view.attempts,
+        settledBy: view.settledBy,
+        ...(view.lastError !== null ? { detail: view.lastError } : {}),
+      },
+    ],
   });
 
   // Dependents that were waiting on this task and are now waiting on nothing.

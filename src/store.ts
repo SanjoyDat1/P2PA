@@ -37,6 +37,7 @@ import {
   type TaskView,
 } from "./task.js";
 import {
+  CONTEXT_KEY_PATTERN,
   CrdtOpArraySchema,
   LEGACY_VERSION_KEY,
   isReservedKey,
@@ -482,6 +483,18 @@ export class ContextStore {
   private assertWritable(key: string): void {
     if (isReservedKey(key)) {
       throw new Error(`Reserved context key is not allowed: ${key}`);
+    }
+    // The wire pattern, checked on the way in rather than on the way out. A key
+    // the local write path accepts and the schema refuses mints an entry that
+    // rides `export()` into every handshake snapshot, and a snapshot is
+    // validated as one array with no per-op tolerance — so one such key makes
+    // the whole replica undeliverable to every peer, and an ordinary key cannot
+    // be deleted back out of a document it has already poisoned.
+    if (!CONTEXT_KEY_PATTERN.test(key)) {
+      throw new Error(
+        `Key "${key}" contains characters no peer will accept; keys may hold ` +
+          `letters, digits and ". _ : @ / -" only`,
+      );
     }
     if (isClaimKey(key)) {
       throw new Error(

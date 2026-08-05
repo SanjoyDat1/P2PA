@@ -812,12 +812,30 @@ discarded by the status join.
 `TASK_RETENTION_MS` alone is not a release valve: it measures from the settling
 stamp, so a board of 500 finished tasks stays full for the whole retention window
 and every attempt to add work is refused for that long — a single authorized peer
-could otherwise wedge task creation swarm-wide. When a local write meets the
-budget, an implementation **SHOULD** evict the longest-settled task before
-refusing. Only **terminal** entries are eligible: evicting an `open` one loses the
-work rather than the record of it, which is why an implementation **MUST** refuse
-rather than evict when every task on the board is still open — and **MUST** say
-so, rather than advising the operator to settle work that is already settled.
+could otherwise wedge task creation swarm-wide. When a write meets the budget, an
+implementation **SHOULD** evict the longest-settled task before refusing. Only
+**terminal** entries are eligible: evicting an `open` one loses the work rather
+than the record of it, which is why an implementation **MUST** refuse rather than
+evict when every task on the board is still open — and **MUST** say so, rather
+than advising the operator to settle work that is already settled.
+
+Eviction **MUST** apply on the merge path as well as the local one. A flood fills
+every node's budget at the same time, which is the case eviction exists for, so a
+node that makes room locally and then refuses the peer's copy of the very task it
+just admitted reports work as created that no peer can see. Two replicas both at
+the cap would also reject each other's entries indefinitely: they never
+reconcile, so their digests never match and the whole document re-ships on every
+reconnect.
+
+**`MAX_TASK_KEYS` is therefore approximate, not exact, and replicas may hold
+different subsets.** Choosing the minimum terminal entry by `(hlc.w, key)` is a
+pure function of *one* document, so it needs no coordination to compute — but two
+replicas reach the cap holding different documents, so they evict different
+entries and stay diverged on which settled tasks they retain. This is a
+deliberate trade of exactness for liveness, and an implementation **MUST NOT**
+present the cap as a guarantee that two replicas hold the same 500 tasks.
+Convergence still holds for every task both replicas retain: eviction drops only
+terminal entries, and a dropped entry that arrives again is simply re-admitted.
 
 A task whose `attempts` has reached `TASK_MAX_ATTEMPTS` **MUST NOT** be offered
 even when its `status` is still `open`: a peer can send `attempts: 999` with
@@ -1191,6 +1209,15 @@ everything a replica can hold.
 - **Result durability under a concurrent descriptor write.** §7A.3: a completion
   can lose its `result` — never its `done` status — to a concurrent write with a
   higher stamp on the same id.
+- **Backlog eviction as a deletion primitive.** §7A.6 lets a write at the budget
+  drop the longest-settled task. Because `@task/` is not owner-bound, an
+  authorized peer can settle a task of yours and then fill the remaining budget
+  with open tasks, leaving that one entry as the only eviction candidate — so the
+  next task created on your node deletes its result. Before eviction existed the
+  same peer had to wait out `TASK_RETENTION_MS`. This is a faster route to an
+  outcome §12.2 already grants such a peer (it can overwrite your result outright,
+  or cancel the task), not a new class of power, but it is a real capability and
+  is recorded here rather than left to be discovered.
 - **Topic secrecy.** A leaked topic reveals that a swarm exists and allows
   connection attempts. In `strict` mode it grants no access.
 - **Peer-supplied text.** `label`, `note`, `role`, `capabilities`, `text`,

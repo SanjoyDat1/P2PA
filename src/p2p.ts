@@ -1206,9 +1206,15 @@ export function downgrade(
     // is already clean. Filtering again is not redundant bookkeeping: this
     // function is exported and documented as the place a frame is shaped for
     // what a connection can read, so the next caller to route a snapshot
-    // through it must not silently lose the §7A.7 guarantee. Unlike an update,
-    // an emptied snapshot is still a valid frame and is sent as one — that is
-    // how a peer learns we have nothing for it.
+    // through it must not silently lose the §7A.7 guarantee.
+    //
+    // Unlike an update, an emptied snapshot is still writable — `SnapshotOpsSchema`
+    // has no `.min(1)` — so it is shaped and returned rather than dropped. It does
+    // reach the peer either way: unchunked it goes as one frame, and chunked it
+    // goes as a single empty part, because `chunkSnapshot([])` returns one empty
+    // part rather than none. That is deliberate on both paths: a peer that
+    // receives an empty snapshot knows the handshake completed and we had nothing
+    // for it, where silence is indistinguishable from a transfer still to come.
     if (envelope.type === "snapshot") {
       const ops = opsForPeer(envelope.ops, caps);
       if (ops.length !== envelope.ops.length) return { ...envelope, ops, v: version };

@@ -619,13 +619,15 @@ function renderAuditEntry(entry: AuditEntry): string {
     );
   }
   if (entry.action === "Task Settled") {
-    return (
-      `${head} - [ACTION: Task Settled]\n` +
-      `- **Task:** \`${safe(entry.taskId)}\`\n` +
-      `- **Outcome:** ${safe(entry.status)} (attempt ${entry.attempt})\n` +
-      `- **Settled by:** \`${safe(entry.settledBy)}\`\n` +
-      (entry.detail !== undefined ? `- **Detail:** ${safe(entry.detail)}\n` : "")
-    );
+    let block = `${head} - [ACTION: Task Settled]\n`;
+    for (const task of entry.tasks) {
+      block +=
+        `- **Task:** \`${safe(task.taskId)}\`\n` +
+        `- **Outcome:** ${safe(task.status)} (attempt ${task.attempt})\n` +
+        `- **Settled by:** \`${safe(task.settledBy)}\`\n` +
+        (task.detail !== undefined ? `- **Detail:** ${safe(task.detail)}\n` : "");
+    }
+    return block;
   }
 
   let block = `${head} - [ACTION: Message]\n- **Content:**\n`;

@@ -224,21 +224,33 @@ export interface TaskCreatedAudit {
 }
 
 /**
- * A task reaching an outcome.
+ * One task reaching an outcome.
  *
- * `settledBy` is the node that wrote the outcome, which is not necessarily the
- * node that held the lease and not necessarily the creator — any allowlisted
- * peer may settle any task, and the audit trail is where that is visible.
+ * `settledBy` is the node that wrote it, which is not necessarily the node that
+ * held the lease and not necessarily the creator — any allowlisted peer may
+ * settle any task, and the audit trail is where that is visible.
  */
-export interface TaskSettledAudit {
-  source: Source;
-  peer?: AuditPeer;
-  action: "Task Settled";
+export interface TaskSettlement {
   taskId: string;
   status: string;
   attempt: number;
   settledBy: string;
   detail?: string;
+}
+
+/**
+ * Settlements from one batch, grouped.
+ *
+ * A list rather than a single task because every audit write re-reads, parses,
+ * rotates and rewrites the whole document: one entry per settled task made a
+ * single envelope cost time quadratic in its size, which is the same trap the
+ * lease branch already groups to avoid.
+ */
+export interface TaskSettledAudit {
+  source: Source;
+  peer?: AuditPeer;
+  action: "Task Settled";
+  tasks: TaskSettlement[];
 }
 
 export type AuditEntry =

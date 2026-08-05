@@ -27,12 +27,12 @@ import { ContextStore } from "../src/store.js";
 import { MarkdownLog } from "../src/markdown-log.js";
 import { ContentionLog } from "../src/conflicts.js";
 import { EventBus } from "../src/events.js";
-import { OpSigner } from "../src/signing.js";
+import { OpSigner, verifyOp } from "../src/signing.js";
 import { CrdtDoc, MAX_TASK_KEYS, type CrdtOp } from "../src/crdt.js";
 import { HybridClock } from "../src/hlc.js";
 import { claimKeyFor, DEFAULT_CLAIM_TTL_MS } from "../src/claim.js";
 import { CAP_TASKS, digestsMatch } from "../src/protocol.js";
-import { downgrade, opsForPeer } from "../src/p2p.js";
+import { chunkSnapshot, downgrade, opsForPeer } from "../src/p2p.js";
 import {
   AbandonedTasks,
   MAX_TASK_DEPS,
@@ -66,7 +66,13 @@ import {
 } from "../src/sync.js";
 import { explainNoWork } from "../src/mcp-server.js";
 import { buildCard } from "../src/presence.js";
-import { PeerEnvelopeSchema, PROTOCOL_VERSION } from "../src/types.js";
+import {
+  CONTEXT_KEY_PATTERN,
+  MAX_JSON_DEPTH,
+  PeerEnvelopeSchema,
+  PROTOCOL_VERSION,
+  type JsonValue,
+} from "../src/types.js";
 
 interface Node extends SyncServices {
   store: ContextStore;
@@ -75,6 +81,8 @@ interface Node extends SyncServices {
   events: EventBus;
   dir: string;
   pubkey: string;
+  /** So a test can mint a signed op this node would never itself produce. */
+  signer: OpSigner;
 }
 
 function makeNode(name: string, now?: () => number): Node {
@@ -84,13 +92,15 @@ function makeNode(name: string, now?: () => number): Node {
   const seed = randomBytes(32);
   const keyPair = DHT.keyPair(seed);
   const pubkey = Buffer.from(keyPair.publicKey).toString("hex");
+  const signer = new OpSigner(seed, pubkey);
   return {
-    store: new ContextStore(pubkey, now ?? Date.now, new OpSigner(seed, pubkey)),
+    store: new ContextStore(pubkey, now ?? Date.now, signer),
     log,
     contention: new ContentionLog(),
     events: new EventBus(),
     dir,
     pubkey,
+    signer,
   };
 }
 
@@ -1316,6 +1326,133 @@ describe("retention", () => {
     assert.equal(remaining.length, MAX_TASK_KEYS);
   });
 
+  /**
+   * Eviction that only happens locally is worse than no eviction at all. A peer
+   * flood fills every node's budget at the same time — the case eviction exists
+   * for — so a node that made room and then had its new task refused by every
+   * peer would report "created, N peer(s) can see it" while none could. And two
+   * replicas both at the cap rejecting each other's entries never reconcile, so
+   * the digest never matches and the whole document re-ships on every reconnect.
+   */
+  it("admits a peer's task at the budget by making the same room", () => {
+    const now = Date.now();
+    const filler = (i: number): CrdtOp => ({
+      key: taskKeyFor(`settled-${String(i).padStart(3, "0")}`),
+      entry: {
+        kind: "task",
+        hlc: { w: now - 1_000 + i, c: 0, n: "c".repeat(16) },
+        title: `filler ${i}`,
+        priority: 5,
+        status: "done",
+        attempts: 0,
+        createdBy: "c".repeat(16),
+        createdAt: now - 1_000,
+      },
+    });
+    handleInboundOps(
+      a,
+      Array.from({ length: MAX_TASK_KEYS }, (_, i) => filler(i)),
+      "Peer",
+    );
+    assert.equal(a.store.taskEntries().length, MAX_TASK_KEYS, "at the cap");
+
+    const arriving: CrdtOp = {
+      key: taskKeyFor("newly-created-elsewhere"),
+      entry: {
+        kind: "task",
+        hlc: { w: now, c: 0, n: "d".repeat(16) },
+        title: "work from a peer that also had to evict",
+        priority: 5,
+        status: "open",
+        attempts: 0,
+        createdBy: "d".repeat(16),
+        createdAt: now,
+      },
+    };
+    const summary = handleInboundOps(a, [arriving], "Peer");
+    assert.equal(summary.rejected, 0, "a full board must not stop the swarm syncing");
+    assert.equal(summary.applied, 1);
+    assert.ok(a.store.task("newly-created-elsewhere"));
+    assert.equal(a.store.taskEntries().length, MAX_TASK_KEYS);
+  });
+
+  it("still refuses a peer's task when every task on the board is open", () => {
+    const now = Date.now();
+    handleInboundOps(
+      a,
+      Array.from({ length: MAX_TASK_KEYS }, (_, i) => ({
+        key: taskKeyFor(`open-${String(i).padStart(3, "0")}`),
+        entry: {
+          kind: "task" as const,
+          hlc: { w: now, c: i % 1000, n: "c".repeat(16) },
+          title: `open ${i}`,
+          priority: 5,
+          status: "open" as const,
+          attempts: 0,
+          createdBy: "c".repeat(16),
+          createdAt: now,
+        },
+      })),
+      "Peer",
+    );
+    const summary = handleInboundOps(
+      a,
+      [
+        {
+          key: taskKeyFor("one-too-many"),
+          entry: {
+            kind: "task",
+            hlc: { w: now, c: 0, n: "d".repeat(16) },
+            title: "no room",
+            priority: 5,
+            status: "open",
+            attempts: 0,
+            createdBy: "d".repeat(16),
+            createdAt: now,
+          },
+        },
+      ],
+      "Peer",
+    );
+    assert.equal(summary.rejected, 1, "open work is never evicted to make room");
+    assert.equal(summary.rejections[0], "task limit reached");
+  });
+
+  /**
+   * `writeTask` returning null has to mean nothing happened. Evicting before the
+   * validator ran left a refused write having destroyed a settled task on its
+   * way out, and a caller reading `null` has no way to know.
+   */
+  it("destroys nothing when the write is refused after making room", () => {
+    const wall = 1_700_000_000_000;
+    const doc = new CrdtDoc(new HybridClock("a".repeat(16), () => wall));
+    const base = {
+      kind: "task" as const,
+      title: "work",
+      priority: 5,
+      attempts: 0,
+      createdBy: "a".repeat(16),
+      createdAt: wall,
+    };
+    for (let i = 0; i < MAX_TASK_KEYS; i += 1) {
+      doc.writeTask(taskKeyFor(`done-${i}`), { ...base, status: "done" }, wall);
+    }
+    const before = doc.taskEntries().map(({ key }) => key);
+
+    const refused = doc.writeTask(
+      taskKeyFor("rejected-write"),
+      { ...base, status: "open" },
+      wall,
+      () => false,
+    );
+    assert.equal(refused, null);
+    assert.deepEqual(
+      doc.taskEntries().map(({ key }) => key),
+      before,
+      "a write that returns null must not have deleted anything",
+    );
+  });
+
   it("refuses, and says why, when every task on a full board is still open", () => {
     const wall = 1_700_000_000_000;
     const doc = new CrdtDoc(new HybridClock("a".repeat(16), () => wall));
@@ -1437,6 +1574,72 @@ describe("the board a human reads", () => {
     assert.match(audit, new RegExp(`\\*\\*Task:\\*\\* \`${created.taskId}\``));
     assert.match(audit, /\*\*Outcome:\*\* done/);
     assert.match(audit, new RegExp(`\\*\\*Settled by:\\*\\* \`${b.store.nodeId}\``));
+  });
+
+  /**
+   * Every audit write re-reads, parses, rotates and rewrites the whole file, so
+   * one entry per settled task made a single envelope cost time quadratic in its
+   * size — the exact trap the lease branch groups to avoid, and which the
+   * comment above it warns about.
+   */
+  it("writes one settlement entry for a whole batch, not one per task", () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      const created = createTask(b, { title: `delegated ${i}` });
+      assert.ok(created.ok);
+      if (!created.ok) return;
+      ids.push(created.taskId);
+    }
+    handleInboundOps(a, ids.flatMap((id) => taskOps(b, id)), "Peer");
+    for (const id of ids) completeTask(b, id, "done");
+
+    handleInboundOps(a, ids.flatMap((id) => taskOps(b, id)), "Peer");
+
+    const audit = sectionOf(readFileSync(a.log.path, "utf8"), "## Audit Trail");
+    const headings = audit.split("[ACTION: Task Settled]").length - 1;
+    assert.equal(headings, 1, "one grouped entry for the batch");
+    for (const id of ids) {
+      assert.match(audit, new RegExp(`\\*\\*Task:\\*\\* \`${id}\``));
+    }
+  });
+
+  /**
+   * The condition has to be a *transition* into terminal, not "applied while
+   * terminal". Otherwise a peer can nudge one already-settled task indefinitely
+   * and each nudge writes a fresh settlement — a peer-controlled lever on a live
+   * audit window that is bounded and rotates.
+   */
+  it("does not re-record a task that was already settled", () => {
+    const created = createTask(b, { title: "delegated work" });
+    assert.ok(created.ok);
+    if (!created.ok) return;
+    handleInboundOps(a, taskOps(b, created.taskId), "Peer");
+    completeTask(b, created.taskId, "first");
+    handleInboundOps(a, taskOps(b, created.taskId), "Peer");
+
+    const after = (): number =>
+      sectionOf(readFileSync(a.log.path, "utf8"), "## Audit Trail").split(
+        "[ACTION: Task Settled]",
+      ).length - 1;
+    assert.equal(after(), 1);
+
+    // Now nudge the settled task repeatedly: each of these is an ordinary merge
+    // that changes something, and none of them is a settlement.
+    for (let i = 0; i < 20; i += 1) {
+      failTask(b, created.taskId, `nudge ${i}`);
+      const entry = b.store.task(created.taskId) as TaskEntry;
+      handleInboundOps(
+        a,
+        [
+          {
+            key: taskKeyFor(created.taskId),
+            entry: { ...entry, attempts: entry.attempts + i + 1 },
+          },
+        ],
+        "Peer",
+      );
+    }
+    assert.equal(after(), 1, "an already-settled task is not settled again");
   });
 
   it("survives an export and reload with its status, attempts and deps intact", async () => {
@@ -1576,7 +1779,8 @@ describe("a peer that never negotiated `task`", () => {
     assert.deepEqual(shaped.ops, [stateOp]);
 
     // An emptied snapshot is still a valid frame, unlike an emptied update:
-    // that is how a peer learns we have nothing for it.
+    // `SnapshotOpsSchema` has no minimum length, so it is shaped rather than
+    // dropped, and it does reach the peer on both paths.
     const emptied = downgrade(
       { type: "snapshot", v: PROTOCOL_VERSION, ops: [taskOp] },
       PROTOCOL_VERSION,
@@ -1584,6 +1788,17 @@ describe("a peer that never negotiated `task`", () => {
     );
     assert.ok(emptied);
     assert.equal(emptied?.type === "snapshot" ? emptied.ops.length : -1, 0);
+    assert.equal(
+      PeerEnvelopeSchema.safeParse({ type: "snapshot", v: PROTOCOL_VERSION, ops: [] })
+        .success,
+      true,
+      "an empty snapshot is a frame a receiver accepts",
+    );
+    assert.deepEqual(
+      chunkSnapshot([]),
+      [[]],
+      "and the chunked path sends one empty part rather than nothing at all",
+    );
   });
 
   it("hashes an empty backlog to the empty string", () => {
@@ -1720,21 +1935,47 @@ describe("locally minted operations stay on the wire schema", () => {
     );
   });
 
+  /**
+   * The task namespace is not the only way into this class, which is why the
+   * guard sits on the shared local-write path. Nesting is the remaining live
+   * instance: `push_context` has no depth check and `setValue` does not either,
+   * so a deep value mints an op the wire schema refuses.
+   */
   it("refuses to broadcast any operation that fails the wire schema", () => {
-    // A key the tool layer permits and the wire pattern does not. The task
-    // namespace is not the only way into this class, which is why the guard
-    // sits on the shared local-write path rather than on `create_task`.
-    const result = commitLocalMutation(a, (store) => store.setKey("bad key", "x"));
+    let deep: JsonValue = "bottom";
+    for (let i = 0; i < MAX_JSON_DEPTH + 5; i += 1) deep = { nested: deep };
+
+    const result = commitLocalMutation(a, (store) => store.setKey("too-deep", deep));
     assert.equal(result.ok, false);
     if (result.ok) return;
     assert.match(result.error, /no peer could read/);
 
-    const text = readFileSync(a.log.path, "utf8");
     assert.doesNotMatch(
-      sectionOf(text, "## Audit Trail"),
-      /bad key/,
+      sectionOf(readFileSync(a.log.path, "utf8"), "## Audit Trail"),
+      /too-deep/,
       "a refused write must not be persisted either",
     );
+  });
+
+  /**
+   * And a key the tool layer used to permit and the wire pattern refuses. This
+   * one is worse than a task: a poisoned `lww` key cannot be deleted back out,
+   * because a tombstone carries the same key and fails the same check — so the
+   * replica stays undeliverable for the life of the document.
+   */
+  it("refuses a context key no peer would accept, before it is written", () => {
+    assert.throws(() => a.store.setKey("bad key", "x"), /no peer will accept/);
+    assert.equal(a.store.get("bad key"), undefined);
+    assert.equal(
+      a.store.export().some((op) => op.key === "bad key"),
+      false,
+      "the poisoned key must never reach the snapshot",
+    );
+
+    // The same rule the receiver applies, so the two cannot drift apart.
+    assert.equal(CONTEXT_KEY_PATTERN.test("bad key"), false);
+    assert.equal(CONTEXT_KEY_PATTERN.test("plan.v2:draft@a/b-1"), true);
+    assert.equal(a.store.setKey("plan.v2:draft@a/b-1", "fine").key, "plan.v2:draft@a/b-1");
   });
 
   it("still admits every ordinary write", () => {
@@ -1867,11 +2108,45 @@ describe("token lists arrive canonical or not at all", () => {
    * appends an audit entry, and drops the author's signature from the replica,
    * which under `requireSignatures` stops the task being relayed onward at all.
    */
-  it("never seats a non-canonical entry, so the replay sequence cannot start", () => {
-    // The reported sequence was: first delivery applied and signed, second
-    // delivery applied and *unsigned*, third ignored. It begins with an entry
-    // whose lists are not canonical getting stored verbatim, so the fix is that
-    // such an entry is never stored at all.
+  /**
+   * The reported sequence was: first delivery applied and signed, second
+   * delivery applied and *unsigned*, third ignored. It begins with an entry
+   * whose lists are not canonical being stored verbatim — so the entry has to be
+   * **signed and otherwise valid**, or the test proves nothing about the refine
+   * that stops it. A locally created task cannot produce one, because
+   * `create_task` canonicalizes; this signs one with the peer's own key.
+   */
+  it("never seats a signed non-canonical entry, so the replay cannot start", () => {
+    const op = b.signer.signOp({
+      key: taskKeyFor("from-a-peer"),
+      entry: {
+        kind: "task",
+        hlc: { w: Date.now(), c: 0, n: b.store.nodeId },
+        title: "peer work",
+        priority: 5,
+        status: "open",
+        deps: ["beta", "alpha"],
+        attempts: 0,
+        createdBy: b.store.nodeId,
+        createdAt: Date.now(),
+      },
+    });
+    assert.equal(verifyOp(op).status, "valid", "the op itself is authentic");
+
+    const first = handleInboundOps(a, [op], "Peer");
+    assert.equal(first.rejected, 1, "a non-canonical list must be refused");
+    assert.equal(first.applied, 0);
+    assert.equal(first.forged, 0, "refused for its shape, not as a forgery");
+    assert.equal(a.store.task("from-a-peer"), undefined);
+
+    // Which is what makes the rest unreachable: nothing was seated, so the
+    // second delivery has nothing to be re-merged against and strip.
+    const second = handleInboundOps(a, [op], "Peer");
+    assert.equal(second.applied, 0);
+    assert.equal(a.store.task("from-a-peer"), undefined);
+  });
+
+  it("refuses an unsigned non-canonical entry the same way", () => {
     const summary = handleInboundOps(a, [peerTask(["beta", "alpha"])], "Peer");
     assert.equal(summary.applied, 0);
     assert.equal(summary.rejected, 1);

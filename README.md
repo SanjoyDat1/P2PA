@@ -453,6 +453,11 @@ abandoned the next time anyone asks for work.
 The board is also written into `~/.p2pa/shared_context.md` under `## Backlog`, so
 a human can read what the swarm is doing without asking it.
 
+The backlog holds 500 tasks. Settled ones are collected after seven days, and a
+board that is already full makes room by dropping the longest-settled task rather
+than refusing new work — so the cap is a queue depth, not a lifetime limit. Open
+tasks are never dropped: if all 500 are open, `create_task` refuses and says so.
+
 ### Claiming work
 
 State sync stops two agents overwriting each other; it does not stop them doing

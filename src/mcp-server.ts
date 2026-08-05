@@ -56,6 +56,7 @@ import {
 import { DEFAULT_WAIT_MS, MAX_WAIT_MS, type EventBus } from "./events.js";
 import type { Outbox } from "./outbox.js";
 import {
+  CONTEXT_KEY_PATTERN,
   MAX_KEY_LENGTH,
   MAX_PAYLOAD_BYTES,
   LEGACY_VERSION_KEY,
@@ -312,10 +313,14 @@ export function explainNoWork(
   return lines.join("\n");
 }
 
+// The wire pattern is part of the tool's contract, not just the transport's: a
+// key this accepts and the schema refuses mints an entry that poisons every
+// handshake snapshot this node sends, and cannot be deleted back out.
 const contextKeySchema = z
   .string()
   .min(1)
   .max(MAX_KEY_LENGTH)
+  .regex(CONTEXT_KEY_PATTERN)
   .refine((k) => !isReservedKey(k) && k !== LEGACY_VERSION_KEY, {
     message: "Reserved or retired key is not allowed",
   });
